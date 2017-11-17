@@ -1,5 +1,5 @@
 /*
- * SSHToken firmware (STM32F1)
+ * CedarKey firmware (STM32F1)
  *
  * Copyright (C) 2017 Denys Fedoryshchenko <nuclearcat@nuclearcat.com>
  *
@@ -18,26 +18,25 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program; if not, see http://www.gnu.org/licenses or write to
  * the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
- * Boston, MA, 02110-1301 USA, or download the license from the following URL:
- * http://itextpdf.com/terms-of-use/
-
+ * Boston, MA, 02110-1301 USA
+ *
  * The interactive user interfaces in modified source and object code versions
  * of this program must display Appropriate Legal Notices, as required under
  * Section 5 of the GNU Affero General Public License.
-
+ *
  * You can be released from the requirements of the license by purchasing
  * a commercial license. Buying such a license is mandatory as soon as you
- * develop commercial activities involving the SSHToken software without
+ * develop commercial activities involving the CedarKey software without
  * disclosing the source code of your own applications.
  */
 
 /*
-* STM32 serial for windoze
-* uint16 *idBase0 =  (uint16 *) (0x1FFFF7E8);
-* uint16 *idBase1 =  (uint16 *) (0x1FFFF7E8+0x02);
-* uint32 *idBase2 =  (uint32 *) (0x1FFFF7E8+0x04);
-* uint32 *idBase3 =  (uint32 *) (0x1FFFF7E8+0x08);
-*/
+ * STM32 serial?
+ * uint16 *idBase0 =  (uint16 *) (0x1FFFF7E8);
+ * uint16 *idBase1 =  (uint16 *) (0x1FFFF7E8+0x02);
+ * uint32 *idBase2 =  (uint32 *) (0x1FFFF7E8+0x04);
+ * uint32 *idBase3 =  (uint32 *) (0x1FFFF7E8+0x08);
+ */
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -68,6 +67,12 @@ volatile uint32_t ticktock;
 // Do not enable it unless you are doing debugging, it makes device insecure!
 #define ALLOW_READING_KEY
 
+// Disable JTAG/SWD on run
+// Soon also enable readout protection
+// Not tested yet!
+//#define PROTECT_HARDER
+
+/* We need to read/write protect 28 pages, 0-27 */
 #define KEYS_OFFSET     (56*1024)
 #define CFG_OFFSET      (55*1024)
 
@@ -77,8 +82,10 @@ volatile uint32_t ticktock;
 #define STATE_WRITE         3
 #define STATE_PRESIGN       4
 #define STATE_PRESIGN2      5
-#define STATE_KEYSELECT     6
-#define STATE_GETPASS       7
+#define STATE_PRESIGN3      6
+#define STATE_KEYSELECT     7
+#define STATE_GETPASS       8
+#define STATE_EMPTY         253
 #define STATE_CONFIGWRITE   254
 
 #define LOCKSTATE_LOCKED                     0
@@ -86,7 +93,6 @@ volatile uint32_t ticktock;
 #define LOCKSTATE_UNLOCKED_FORSIGN_ALLKEY    2
 #define LOCKSTATE_UNLOCKED_FORWRITE          3
 
-static const char unlock_pin[] = "1234567890";
 uint32_t stick_state = STATE_DEFAULT;
 uint32_t bytes_written = 0;
 char *bigbuf = NULL;
@@ -94,6 +100,7 @@ char tmplenbuf[4];
 unsigned char *password;
 uint32_t current_key_index = 0;
 usbd_device *usbd_dev;
+uint32_t signature_type = 0;
 
 static void pgm_prewrite_key (uint32_t);
 static void pgm_write_key (char *data, uint32_t len);
@@ -108,8 +115,8 @@ static const struct usb_device_descriptor dev = {
         .bDeviceSubClass = 0,
         .bDeviceProtocol = 0,
         .bMaxPacketSize0 = 64,
-        .idVendor = 0x0483,
-        .idProduct = 0x5740,
+        .idVendor = 0xf055,
+        .idProduct = 0x0001,
         .bcdDevice = 0x0200,
         .iManufacturer = 1,
         .iProduct = 2,
@@ -231,8 +238,8 @@ static const struct usb_config_descriptor config = {
 
 static const char *usb_strings[] = {
         "Denys Fedoryshchenko",
-        "BlueKey Dongle",
-        "ALPHA00002",
+        "CedarKey Dongle",
+        "BETA1",
 };
 
 /* Buffer to be used for control requests. */
@@ -326,18 +333,21 @@ static int verify_pin(unsigned char *data, uint32_t len) {
         unsigned char* salt_ptr= (unsigned char*)start_address+4;
         unsigned char* verification_saltedhash_ptr= (unsigned char*)start_address+68;
 
-                unsigned char input[128];
-                unsigned char output[64];
-                memset(input, 0x0, 128);
-                /* Hashing [salt,entered_pin,0x0 padding] */
-                memcpy(input, salt_ptr, 64);
-                memcpy(input+64, data, len);
-                mbedtls_sha512((unsigned char*)input, 128, output, 0);
-                // TODO: timing attack protection (as it might weaken - with power analysis can know if pin correct or no)
-                return(memcmp(output, verification_saltedhash_ptr, 64));
+        unsigned char input[128];
+        unsigned char output[64];
+        memset(input, 0x0, 128);
+        /* Hashing [salt,entered_pin,0x0 padding] */
+        memcpy(input, salt_ptr, 64);
+        memcpy(input+64, data, len);
+        mbedtls_sha512((unsigned char*)input, 128, output, 0);
+        memset(input, 0x0, 128);
+        // TODO: timing attack protection (as it might weaken - with power analysis can know if pin correct or no)
+        return(memcmp(output, verification_saltedhash_ptr, 64));
 }
 
-static void sign_data (uint32_t index) {
+// mbedtls_pk_get_type
+
+static void sign_data_rsa (uint32_t index) {
         unsigned char hash[64];
         mbedtls_pk_context pk;
         int n = 0;
@@ -345,7 +355,10 @@ static void sign_data (uint32_t index) {
         uint32_t start_address = 0x08000000 + KEYS_OFFSET + (index*4096);
         unsigned char* memory_ptr= (unsigned char*)start_address;
 
-        mbedtls_sha512((unsigned char*)bigbuf, bytes_written, hash, 0);
+        if (signature_type == 0)
+          mbedtls_sha512((unsigned char*)bigbuf, bytes_written, hash, 0);
+        else
+          mbedtls_sha256((unsigned char*)bigbuf, bytes_written, hash, 0);
         /* Release memory early, we don't need this data anymore
            and we are very short on ram
          */
@@ -362,7 +375,10 @@ static void sign_data (uint32_t index) {
                 uint32_t starttock = ticktock;
                 // TODO: Add handling of counter rollover. Do we really expect stick to stay 49 days?
 #endif
-                mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA512, hash, 0, (unsigned char*)out, &outn, NULL, NULL);
+                if (signature_type == 0)
+                  mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA512, hash, 0, (unsigned char*)out, &outn, NULL, NULL);
+                else
+                  mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256, hash, 0, (unsigned char*)out, &outn, NULL, NULL);
 #ifdef TIMING_PROTECTION
                 while (ticktock < starttock + 15000) ;
 #endif
@@ -503,12 +519,12 @@ static void feed_rx_data(char byte) {
                                 stick_state = STATE_DEFAULT;
                                 free(password);
                                 password = NULL;
+                                bytes_written = 1; /* THIS IS SPECIAL STATE INDICATING KEY IS JUST UNLOCKED! */
                         } else {
                                 memset(password, 0x0, 65);
+                                bytes_written = 0;
                                 // sleep for a while?
                         }
-                        bytes_written = 0;
-
                 } else {
                         password[bytes_written] = byte;
                         bytes_written++;
@@ -539,7 +555,28 @@ static void feed_rx_data(char byte) {
         }
                 stick_state = STATE_DEFAULT;
                 break;
+        /* I add this state because crappy systemd/modemmanager probe devices
+           and send garbage to them
+         */
+#define FLASH_OBP_RDP   0x1FFFF800
+#define FLASH_OBP_WRP10 0x1FFFF808
+        case STATE_EMPTY:
+                if (byte == 0x1) {
+                        stick_state = STATE_CONFIGWRITE;
+#ifdef PROTECT_HARDER
+                        flash_unlock();
+                        flash_unlock_option_bytes();
+                        flash_wait_for_last_operation();
+                        flash_erase_option_bytes();
+                        flash_program_option_bytes(FLASH_OBP_RDP, 0x0);
+                        // Writeout protection as well TODO
+#endif
+                        flash_lock();
+                }
+                break;
+
         case STATE_CONFIGWRITE:
+                gpio_set(GPIOC, GPIO13);
                 bigbuf[bytes_written] = byte;
                 bytes_written++;
                 if (bytes_written == 1024) {
@@ -551,7 +588,7 @@ static void feed_rx_data(char byte) {
                         bytes_written = 0;
                         free(bigbuf);
                         bigbuf = NULL;
-                        gpio_toggle(GPIOC, GPIO13);
+
                 }
                 break;
         /* Write key to flash TODO: verify it with parse after writing? */
@@ -574,7 +611,7 @@ static void feed_rx_data(char byte) {
                 }
                 break;
 
-        case STATE_PRESIGN2:
+        case STATE_PRESIGN3:
         {        /* Len of data to sign received, proceed to receive this data */
                  /* Not efficient, each time, but i dont want one more static variable */
                 uint32_t expected_data;
@@ -586,14 +623,15 @@ static void feed_rx_data(char byte) {
                 /* Is it last byte? sign and output result*/
                 if (bytes_written == expected_data) {
                         gpio_toggle(GPIOC, GPIO13); // TODO: optional, change LED state to show we are in process of signing, mb make it blink?
-                        sign_data(current_key_index); // TODO: use current key variable
+                        if (signature_type == 0 || signature_type == 1)
+                          sign_data_rsa(current_key_index);
                         bytes_written = 0;
                         stick_state = STATE_DEFAULT;
                 }
                 break;
         }
         /* Receive length of signature */
-        case STATE_PRESIGN:
+        case STATE_PRESIGN2:
         {
                 tmplenbuf[bytes_written] = byte;
                 bytes_written++;
@@ -607,17 +645,26 @@ static void feed_rx_data(char byte) {
                            need to be sure. We can't afford more anyway */
                         if (expected_data < 1024) {
                                 bigbuf = malloc(1024);
-                                stick_state = STATE_PRESIGN2;
+                                stick_state = STATE_PRESIGN3;
                         } else {
                                 stick_state = STATE_DEFAULT;
                         }
                 }
-                break;
         }
+        break;
+        /* Receive type of signature */
+        case STATE_PRESIGN:
+          signature_type = byte;
+          if (signature_type != 0 && signature_type != 1) {
+            stick_state = STATE_DEFAULT;
+          } else {
+            stick_state = STATE_PRESIGN2;
+          }
+        break;
         /* Receive key index and TODO: in future key len maybe */
         case STATE_DEFAULT:
         {
-                char veranswer[] = "V1a-X\r\n";
+                char veranswer[] = "V1a-X";
                 switch(byte) {
                 /* Dongle ID */
                 case 'V':
@@ -626,12 +673,18 @@ static void feed_rx_data(char byte) {
                         break;
                 /* Write key */
                 case 'W':
-                        pgm_prewrite_key(current_key_index);
+                        /* This value has 1(magic value) only if it is just unlocked, otherwise don't allow write to avoid random key erasure
+                           TODO: add separate admin PIN
+                        */
+                        if (bytes_written != 1)
+                          break;
                         bytes_written = 0;
+                        pgm_prewrite_key(current_key_index);
                         stick_state = STATE_WRITE;
                         /* TODO such fat buffer maybe not necessary,
                            we can rewrite by writing 4 byte chunks */
                         bigbuf = malloc(4096);
+                        memset(bigbuf, 0x0, 4096);
                         break;
                 /* Select key index */
                 case 'X':
@@ -649,7 +702,7 @@ static void feed_rx_data(char byte) {
                         if (!password) {
                                 password = malloc(65);
                                 memset(password, 0x0, 65);
-                              }
+                        }
                         break;
                 /* Lock dongle */
                 case 'Z':
@@ -692,9 +745,7 @@ static void feed_rx_data(char byte) {
 static void cdcacm_data_rx_cb(usbd_device *usbd_dev_local, uint8_t ep)
 {
         (void)ep;
-        (void)usbd_dev_local;
-
-        char buf[68];         // We might need 4 bytes for remainder
+        char buf[64];
         uint32_t len = usbd_ep_read_packet(usbd_dev_local, 0x01, buf, 64);
 
         if (len) {
@@ -706,9 +757,6 @@ static void cdcacm_data_rx_cb(usbd_device *usbd_dev_local, uint8_t ep)
 
 static void cdcacm_set_config(usbd_device *usbd_dev_local, uint16_t wValue)
 {
-        (void)wValue;
-        (void)usbd_dev_local;
-
         usbd_ep_setup(usbd_dev_local, 0x01, USB_ENDPOINT_ATTR_BULK, 64, cdcacm_data_rx_cb);
         usbd_ep_setup(usbd_dev_local, 0x82, USB_ENDPOINT_ATTR_BULK, 64, NULL);
         usbd_ep_setup(usbd_dev_local, 0x83, USB_ENDPOINT_ATTR_INTERRUPT, 16, NULL);
@@ -790,6 +838,11 @@ int main(void) {
 
         rcc_periph_clock_enable(RCC_GPIOC);
         rcc_periph_clock_enable(RCC_GPIOA);
+        rcc_periph_clock_enable(RCC_AFIO);
+
+#ifdef PROTECT_HARDER
+        gpio_primary_remap(AFIO_MAPR_SWJ_CFG_JTAG_OFF_SW_OFF, 0); // Disable JTAG/SWD
+#endif
 
         /* Hack for bluepill USB resistor issue */
         gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_2_MHZ,
@@ -812,7 +865,7 @@ int main(void) {
                 uint32_t cfg;
                 cfg_read(&cfg, 4, 0);
                 if (cfg == 0xFFFFFFFF && !bigbuf) {
-                        stick_state = STATE_CONFIGWRITE;
+                        stick_state = STATE_EMPTY;
                         bigbuf = malloc(1024);
                         gpio_clear(GPIOC, GPIO13);
                 } else {
