@@ -28,6 +28,7 @@
  * a commercial license. Buying such a license is mandatory as soon as you
  * develop commercial activities involving the CedarKey software without
  * disclosing the source code of your own applications.
+ * For more information, please contact at this address: key@nuclearcat.com
  */
 
 /*
@@ -73,8 +74,13 @@ volatile uint32_t ticktock;
 //#define PROTECT_HARDER
 
 /* We need to read/write protect 28 pages, 0-27 */
-#define KEYS_OFFSET     (56*1024)
-#define CFG_OFFSET      (55*1024)
+#define FLASH_ADDRESS             0x08000000
+#define KEYS_OFFSET               (56*1024)
+#define CFG_OFFSET                (55*1024)
+#define CFG_SALT_OFFSET           4
+#define CFG_USERPIN_HASH_OFFSET   68
+#define CFG_ADMINPIN_HASH_OFFSET  132
+#define CFG_SIZES_OFFSET          196
 
 #define STATE_UNLOCKING     0
 #define STATE_DEFAULT       1
@@ -106,6 +112,10 @@ static void pgm_prewrite_key (uint32_t);
 static void pgm_write_key (char *data, uint32_t len);
 static void pgm_read_key (uint32_t);
 static void pgm_config(char *);
+
+#ifdef ALLOW_READING_KEY
+#pragma message ("YOU HAVE INSECURE CONFIGURATION! REMOVE ALLOW_READING_KEY AS ITS FOR DEBUGGING ONLY")
+#endif
 
 static const struct usb_device_descriptor dev = {
         .bLength = USB_DT_DEVICE_SIZE,
@@ -297,18 +307,37 @@ static void usb_write_packedlen(uint32_t len) {
         while(usbd_ep_write_packet(usbd_dev, 0x82, &network_order_len, 4) == 0) ;
 }
 
-static int findkeylen(unsigned char *memptr) {
-        int i;
-        /* TODO: put in header if key present or not */
-        for (i=0; i<4096; i++) {
-                if (*(memptr+i) == 0x0) {
+static uint32_t findkeyoffset(uint32_t index) {
+        uint32_t key_size_address = FLASH_ADDRESS + CFG_OFFSET + CFG_SIZES_OFFSET;
+        uint32_t i;
+        uint32_t sum_offset = 0;
+        uint32_t *sz_key;
+
+        for (i=0; i<index; i++) {
+                sz_key = (uint32_t*)(key_size_address+i*4);
+                if (*sz_key == UINT_MAX)
+                        return(0);
+                sum_offset += *sz_key;
+        }
+        return(sum_offset);
+}
+
+static uint32_t findkeylen(uint32_t index) {
+        uint32_t key_size_address = FLASH_ADDRESS + CFG_OFFSET + CFG_SIZES_OFFSET + (index*4);
+        uint32_t *sz_key = (uint32_t*)key_size_address;
+        return(*sz_key);
+}
+
+static void walktofreekey(void) {
+        uint32_t key_size_address = FLASH_ADDRESS + CFG_OFFSET + CFG_SIZES_OFFSET;
+        uint32_t *sz_key;
+        for (int i=0; i<128; i++) {
+                sz_key = (uint32_t*)(key_size_address+i*4);
+                if (*sz_key == UINT_MAX) {
+                        current_key_index = i;
                         break;
                 }
         }
-        /* Key not found hack TODO: fix it */
-        if (i == 4096)
-                i = 0;
-        return(i+1);
 }
 
 /*
@@ -323,15 +352,15 @@ static int findkeylen(unsigned char *memptr) {
  */
 
 static void cfg_read (void *data, uint32_t len, uint32_t offset) {
-        uint32_t start_address = 0x08000000 + CFG_OFFSET + offset;
+        uint32_t start_address = FLASH_ADDRESS + CFG_OFFSET + offset;
         unsigned char* memory_ptr= (unsigned char*)start_address;
         memcpy(data, memory_ptr, len);
 }
 
 static int verify_pin(unsigned char *data, uint32_t len) {
-        uint32_t start_address = 0x08000000 + CFG_OFFSET;
-        unsigned char* salt_ptr= (unsigned char*)start_address+4;
-        unsigned char* verification_saltedhash_ptr= (unsigned char*)start_address+68;
+        uint32_t start_address = FLASH_ADDRESS + CFG_OFFSET;
+        unsigned char* salt_ptr= (unsigned char*)start_address+CFG_SALT_OFFSET;
+        unsigned char* verification_saltedhash_ptr= (unsigned char*)start_address+CFG_USERPIN_HASH_OFFSET;
 
         unsigned char input[128];
         unsigned char output[64];
@@ -352,13 +381,14 @@ static void sign_data_rsa (uint32_t index) {
         mbedtls_pk_context pk;
         int n = 0;
         size_t outn;
-        uint32_t start_address = 0x08000000 + KEYS_OFFSET + (index*4096);
+        //uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + (index*4096);
+        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + findkeyoffset(index);
         unsigned char* memory_ptr= (unsigned char*)start_address;
 
         if (signature_type == 0)
-          mbedtls_sha512((unsigned char*)bigbuf, bytes_written, hash, 0);
+                mbedtls_sha512((unsigned char*)bigbuf, bytes_written, hash, 0);
         else
-          mbedtls_sha256((unsigned char*)bigbuf, bytes_written, hash, 0);
+                mbedtls_sha256((unsigned char*)bigbuf, bytes_written, hash, 0);
         /* Release memory early, we don't need this data anymore
            and we are very short on ram
          */
@@ -366,7 +396,11 @@ static void sign_data_rsa (uint32_t index) {
         bigbuf = NULL;
         mbedtls_pk_init(&pk);
         {
-                int i = findkeylen(memory_ptr);
+                uint32_t i = findkeylen(index);
+                if (!start_address || i == UINT_MAX) {
+                        mbedtls_pk_free(&pk);
+                        return;
+                }
                 n = mbedtls_pk_parse_key(&pk, memory_ptr, i, password, strlen((char*)password));
         }
         if (!n) {
@@ -376,9 +410,9 @@ static void sign_data_rsa (uint32_t index) {
                 // TODO: Add handling of counter rollover. Do we really expect stick to stay 49 days?
 #endif
                 if (signature_type == 0)
-                  mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA512, hash, 0, (unsigned char*)out, &outn, NULL, NULL);
+                        mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA512, hash, 0, (unsigned char*)out, &outn, NULL, NULL);
                 else
-                  mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256, hash, 0, (unsigned char*)out, &outn, NULL, NULL);
+                        mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256, hash, 0, (unsigned char*)out, &outn, NULL, NULL);
 #ifdef TIMING_PROTECTION
                 while (ticktock < starttock + 15000) ;
 #endif
@@ -400,11 +434,16 @@ static void test_key (uint32_t index) {
         unsigned char hash[64];
         unsigned char out[512];
         size_t outn;
-        uint32_t start_address = 0x08000000 + KEYS_OFFSET + (index*4096);
+        //uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + (index*4096);
+        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + findkeyoffset(index);
         unsigned char* memory_ptr= (unsigned char*)start_address;
-        int i = findkeylen(memory_ptr);
+        uint32_t i = findkeylen(index);
 
+        if (i == 0)
+                send_error();
         while(usbd_ep_write_packet(usbd_dev, 0x82, "0", 1) == 0) ;
+        if (i == UINT32_MAX)
+                send_error();
         while(usbd_ep_write_packet(usbd_dev, 0x82, "1", 1) == 0) ;
         mbedtls_pk_init(&pk);
         while(usbd_ep_write_packet(usbd_dev, 0x82, "2", 1) == 0) ;
@@ -414,9 +453,9 @@ static void test_key (uint32_t index) {
                 while(usbd_ep_write_packet(usbd_dev, 0x82, "U", 1) == 0) ;
                 rsa = mbedtls_pk_rsa(pk);
                 if (mbedtls_rsa_check_pubkey(rsa))
-                        gpio_set(GPIOC, GPIO13);
+                        gpio_clear(GPIOC, GPIO13);
                 if (mbedtls_rsa_check_privkey(rsa))
-                        gpio_set(GPIOC, GPIO13);
+                        gpio_clear(GPIOC, GPIO13);
         } else {
                 while(usbd_ep_write_packet(usbd_dev, 0x82, "E", 1) == 0) ;
         }
@@ -429,7 +468,14 @@ static void test_key (uint32_t index) {
                 while(usbd_ep_write_packet(usbd_dev, 0x82, "E", 1) == 0) ;
         }
         mbedtls_pk_free(&pk);
-
+        walktofreekey();
+        if (current_key_index > 30) {
+                while(usbd_ep_write_packet(usbd_dev, 0x82, "E", 1) == 0) ;
+        } else {
+                char rs[] = "0";
+                rs[0]+=current_key_index;
+                while(usbd_ep_write_packet(usbd_dev, 0x82, rs, 1) == 0) ;
+        }
 }
 #endif
 
@@ -437,9 +483,15 @@ static int list_key (uint32_t index) {
         mbedtls_rsa_context *rsa;
         mbedtls_pk_context pk;
         int n;
-        uint32_t start_address = 0x08000000 + KEYS_OFFSET + (index*4096);
+        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + findkeyoffset(index);
         unsigned char* memory_ptr= (unsigned char*)start_address;
-        int i = findkeylen(memory_ptr);
+        uint32_t i = findkeylen(index);
+
+        if (i == UINT_MAX) {
+          usb_write_packedlen(0);
+          return(0);
+        }
+
         mbedtls_pk_init(&pk);
         n = mbedtls_pk_parse_key(&pk, memory_ptr, i, password, strlen((char*)password));
         if (!n) {
@@ -548,20 +600,22 @@ static void feed_rx_data(char byte) {
         case STATE_KEYSELECT:
         {
                 int idx = byte - '0';
-                if (idx >= 0 && idx < 10) {
+                if (idx >= 0 && idx < 30) {
                         current_key_index = idx;
                         usbd_ep_write_packet(usbd_dev, 0x82, &byte, 1);
                 }
         }
                 stick_state = STATE_DEFAULT;
                 break;
-        /* I add this state because crappy systemd/modemmanager probe devices
-           and send garbage to them
-         */
+
+                /* I add this state because crappy systemd/modemmanager probe devices
+                   and send garbage to them
+                 */
 #define FLASH_OBP_RDP   0x1FFFF800
 #define FLASH_OBP_WRP10 0x1FFFF808
         case STATE_EMPTY:
                 if (byte == 0x1) {
+                        gpio_set(GPIOC, GPIO13);
                         stick_state = STATE_CONFIGWRITE;
 #ifdef PROTECT_HARDER
                         flash_unlock();
@@ -576,7 +630,6 @@ static void feed_rx_data(char byte) {
                 break;
 
         case STATE_CONFIGWRITE:
-                gpio_set(GPIOC, GPIO13);
                 bigbuf[bytes_written] = byte;
                 bytes_written++;
                 if (bytes_written == 1024) {
@@ -599,7 +652,15 @@ static void feed_rx_data(char byte) {
                         byte = 0x0; /* Final byte should be 0 */
                         bigbuf[bytes_written] = byte;
                         stick_state = STATE_DEFAULT;
-                        pgm_write_key(bigbuf, 4096);
+                        bytes_written++;
+                        // Round bytes
+                        if (bytes_written % 4 != 0) {
+                                uint32_t bytes = ((bytes_written / 4) * 4) + 4;
+                                bytes_written = bytes;
+                        }
+
+                        pgm_write_key(bigbuf, bytes_written);
+                        memset(bigbuf, 0x0, 4096);
                         free(bigbuf);
                         /* Final byte and write is done! */
                         usbd_ep_write_packet(usbd_dev, 0x82, "#", 1);
@@ -624,7 +685,7 @@ static void feed_rx_data(char byte) {
                 if (bytes_written == expected_data) {
                         gpio_toggle(GPIOC, GPIO13); // TODO: optional, change LED state to show we are in process of signing, mb make it blink?
                         if (signature_type == 0 || signature_type == 1)
-                          sign_data_rsa(current_key_index);
+                                sign_data_rsa(current_key_index);
                         bytes_written = 0;
                         stick_state = STATE_DEFAULT;
                 }
@@ -654,13 +715,13 @@ static void feed_rx_data(char byte) {
         break;
         /* Receive type of signature */
         case STATE_PRESIGN:
-          signature_type = byte;
-          if (signature_type != 0 && signature_type != 1) {
-            stick_state = STATE_DEFAULT;
-          } else {
-            stick_state = STATE_PRESIGN2;
-          }
-        break;
+                signature_type = byte;
+                if (signature_type != 0 && signature_type != 1) {
+                        stick_state = STATE_DEFAULT;
+                } else {
+                        stick_state = STATE_PRESIGN2;
+                }
+                break;
         /* Receive key index and TODO: in future key len maybe */
         case STATE_DEFAULT:
         {
@@ -675,11 +736,12 @@ static void feed_rx_data(char byte) {
                 case 'W':
                         /* This value has 1(magic value) only if it is just unlocked, otherwise don't allow write to avoid random key erasure
                            TODO: add separate admin PIN
-                        */
+                         */
                         if (bytes_written != 1)
-                          break;
+                                break;
                         bytes_written = 0;
-                        pgm_prewrite_key(current_key_index);
+                        walktofreekey();
+                        //pgm_prewrite_key(current_key_index);
                         stick_state = STATE_WRITE;
                         /* TODO such fat buffer maybe not necessary,
                            we can rewrite by writing 4 byte chunks */
@@ -717,6 +779,7 @@ static void feed_rx_data(char byte) {
                 case 'L':
                         list_key(current_key_index);
                         break;
+
                         /* TODO: ping, timeout? */
 #ifdef ALLOW_READING_KEY
                 /* WARNING! CRITICALLY INSECURE! DO NOT USE IT! */
@@ -757,6 +820,8 @@ static void cdcacm_data_rx_cb(usbd_device *usbd_dev_local, uint8_t ep)
 
 static void cdcacm_set_config(usbd_device *usbd_dev_local, uint16_t wValue)
 {
+        (void)wValue;
+
         usbd_ep_setup(usbd_dev_local, 0x01, USB_ENDPOINT_ATTR_BULK, 64, cdcacm_data_rx_cb);
         usbd_ep_setup(usbd_dev_local, 0x82, USB_ENDPOINT_ATTR_BULK, 64, NULL);
         usbd_ep_setup(usbd_dev_local, 0x83, USB_ENDPOINT_ATTR_INTERRUPT, 16, NULL);
@@ -773,8 +838,9 @@ void sys_tick_handler(void) {
 }
 
 #ifdef ALLOW_READING_KEY
+// Debug and invalid
 static void pgm_read_key (uint32_t index) {
-        uint32_t start_address = 0x08000000 + KEYS_OFFSET + (index * 4096);
+        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + (index * 4096);
         uint8_t *memory_ptr= (uint8_t*)((uint32_t*)start_address);
 
         uint16_t i;
@@ -788,20 +854,23 @@ static void pgm_read_key (uint32_t index) {
 
 /* TODO: larger flashes has page >1024. Handle that correctly! */
 static void pgm_config(char *data) {
-        uint32_t start_address = 0x08000000 + CFG_OFFSET;
+        uint32_t start_address = FLASH_ADDRESS + CFG_OFFSET;
         uint32_t address_offset = 0;
         flash_erase_page(start_address);
         flash_unlock();
-        while(address_offset < 1024) {
+        /* Program only until sizes */
+        while(address_offset < CFG_SIZES_OFFSET) {
                 flash_program_word(start_address + address_offset, *((uint32_t*)(data + address_offset)));
                 address_offset += 4;
         }
         flash_lock();
 }
 
-/* Erase pages where key will be stored */
+/* Erase pages where key will be stored
+   UPD: We dont need that anymore as we wont erase keys
+ */
 static void pgm_prewrite_key (uint32_t index) {
-        uint32_t start_address = 0x08000000 + KEYS_OFFSET + (index*4096);
+        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET +findkeyoffset(index);
         uint32_t i;
         // TODO: Change this. 16 for "invisible" 64kb flash
         if (index > 9) {
@@ -818,13 +887,16 @@ static void pgm_prewrite_key (uint32_t index) {
 
 // Should be divisible by 4 byte!
 static void pgm_write_key (char *data, uint32_t len) {
-        uint32_t start_address = 0x08000000 + KEYS_OFFSET + (current_key_index*4096);
+        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + findkeyoffset(current_key_index);
         uint32_t address_offset = 0;
+        uint32_t key_size_address = FLASH_ADDRESS + CFG_OFFSET + CFG_SIZES_OFFSET + (current_key_index * 4);
 
+        flash_unlock();
         while(address_offset < len) {
                 flash_program_word(start_address + address_offset, *((uint32_t*)(data + address_offset)));
                 address_offset += 4;
         }
+        flash_program_word(key_size_address, len);
         flash_lock();
         send_ok();
 }
