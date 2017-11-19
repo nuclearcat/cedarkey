@@ -689,7 +689,7 @@ static void feed_rx_data(char byte) {
                         usbd_ep_write_packet(usbd_dev, 0x82, "#", 1);
                 }
                 break;
-
+        /* Blink specific number of times with small pause access code */
         case STATE_PRESIGNBLOCKED:
         {
           if (byte - '0' != (uint8_t)bytes_written) {
