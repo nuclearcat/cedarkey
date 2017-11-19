@@ -12,12 +12,14 @@ As alternative you can take a look to gnuk(https://www.fsij.org/category/gnuk.ht
 have only 64k flash (officially).
 
 QA
-Nothing here yet
+Q: What is Blinker feature?
+A: On key sign you will be asked for password, you should count blinks on dongle and enter number 1-6. If answer is incorrect - dongle will locks,
+until you unplug it and plug back. This is semi-replacement of "touch confirmation" as Blue Pill don't have hardware buttons.
 
 Quickstart (under development)
 Required Hardware:
 )STM32F103 board with SWD header (for example Blue Pill http://wiki.stm32duino.com/index.php?title=Blue_Pill)
-)ST-Link V2 programmer
+)ST-Link V2 programmer (you can use j-link or others, but they are not covered in quickstart)
 )3x female-female wires
 Software:
 )https://github.com/texane/stlink

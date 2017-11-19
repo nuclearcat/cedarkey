@@ -55,6 +55,7 @@
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/pk.h"
+#include "common.h"
 volatile uint32_t ticktock;
 
 // Optional for testing code for overflows and etc
@@ -66,7 +67,7 @@ volatile uint32_t ticktock;
 
 // THIS COMPROMISES SECURITY!!!!
 // Do not enable it unless you are doing debugging, it makes device insecure!
-#define ALLOW_READING_KEY
+//#define ALLOW_READING_KEY
 
 // Disable JTAG/SWD on run
 // Soon also enable readout protection
@@ -82,17 +83,20 @@ volatile uint32_t ticktock;
 #define CFG_ADMINPIN_HASH_OFFSET  132
 #define CFG_SIZES_OFFSET          196
 
-#define STATE_UNLOCKING     0
-#define STATE_DEFAULT       1
-#define STATE_PREWRITE      2
-#define STATE_WRITE         3
-#define STATE_PRESIGN       4
-#define STATE_PRESIGN2      5
-#define STATE_PRESIGN3      6
-#define STATE_KEYSELECT     7
-#define STATE_GETPASS       8
-#define STATE_EMPTY         253
-#define STATE_CONFIGWRITE   254
+
+#define STATE_UNLOCKING       0
+#define STATE_DEFAULT         1
+#define STATE_PREWRITE        2
+#define STATE_WRITE           3
+#define STATE_PRESIGNBLOCKED  4
+#define STATE_PRESIGN         5
+#define STATE_PRESIGN2        6
+#define STATE_PRESIGN3        7
+#define STATE_KEYSELECT       8
+#define STATE_GETPASS         9
+#define STATE_BLOCKED         252
+#define STATE_EMPTY           253
+#define STATE_CONFIGWRITE     254
 
 #define LOCKSTATE_LOCKED                     0
 #define LOCKSTATE_UNLOCKED_FORSIGN_ONEKEY    1
@@ -108,12 +112,11 @@ uint32_t current_key_index = 0;
 usbd_device *usbd_dev;
 uint32_t signature_type = 0;
 
-static void pgm_prewrite_key (uint32_t);
+//static void pgm_prewrite_key (uint32_t);
 static void pgm_write_key (char *data, uint32_t len);
-static void pgm_read_key (uint32_t);
 static void pgm_config(char *);
-
 #ifdef ALLOW_READING_KEY
+static void pgm_read_key (uint32_t);
 #pragma message ("YOU HAVE INSECURE CONFIGURATION! REMOVE ALLOW_READING_KEY AS ITS FOR DEBUGGING ONLY")
 #endif
 
@@ -265,6 +268,21 @@ static void send_error (void) {
         while (usbd_ep_write_packet(usbd_dev, 0x82, buf, 1) == 0) ;
 }
 
+/* Pseudorandom */
+static int blinker_random (void) {
+  unsigned char tmpbuf[128];
+  unsigned char hash[32];
+  uint32_t ticktock_now = ticktock;
+  uint32_t start_address = FLASH_ADDRESS + CFG_OFFSET;
+  unsigned char* salt_ptr= (unsigned char*)start_address+CFG_SALT_OFFSET;
+  memcpy(tmpbuf, salt_ptr, 64);
+  memcpy(&tmpbuf[64], &ticktock_now, 4);
+  mbedtls_sha256((unsigned char*)bigbuf, 128, hash, 0);
+  if ((hash[0] % 6) == 0)
+    return(6);
+  else
+    return(hash[0] % 6);
+}
 
 static int cdcacm_control_request(usbd_device *usbd_dev_local, struct usb_setup_data *req, uint8_t **buf,
                                   uint16_t *len, void (**complete) (usbd_device *usbd_dev, struct usb_setup_data *req)) {
@@ -672,6 +690,17 @@ static void feed_rx_data(char byte) {
                 }
                 break;
 
+        case STATE_PRESIGNBLOCKED:
+        {
+          if (byte - '0' != (uint8_t)bytes_written) {
+            stick_state = STATE_BLOCKED;
+          } else {
+            stick_state = STATE_PRESIGN;
+            gpio_clear(GPIOC, GPIO13); // it will be toggled during sign
+            bytes_written = 0;
+          }
+        }
+        break;
         case STATE_PRESIGN3:
         {        /* Len of data to sign received, proceed to receive this data */
                  /* Not efficient, each time, but i dont want one more static variable */
@@ -754,8 +783,17 @@ static void feed_rx_data(char byte) {
                         break;
                 /* Request signing (TODO: SHA256 option) */
                 case 'S':
-                        bytes_written = 0;
-                        stick_state = STATE_PRESIGN;
+                        {
+                          uint32_t cfg;
+                          cfg_read(&cfg, 4, 0);
+                          if (cfg & CFG_BIT_BLINKERLOCK) {
+                            stick_state = STATE_PRESIGNBLOCKED;
+                            bytes_written = blinker_random();
+                          } else {
+                            stick_state = STATE_PRESIGN;
+                            bytes_written = 0;
+                          }
+                        }
                         break;
                 /* Set password for unlocking keys */
                 case 'P':
@@ -866,9 +904,10 @@ static void pgm_config(char *data) {
         flash_lock();
 }
 
-/* Erase pages where key will be stored
-   UPD: We dont need that anymore as we wont erase keys
+/*
+  Leave for future, when we gain capability of rewriting/erasing keys
  */
+ /*
 static void pgm_prewrite_key (uint32_t index) {
         uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET +findkeyoffset(index);
         uint32_t i;
@@ -884,6 +923,7 @@ static void pgm_prewrite_key (uint32_t index) {
                 flash_wait_for_last_operation();
         }
 }
+*/
 
 // Should be divisible by 4 byte!
 static void pgm_write_key (char *data, uint32_t len) {
@@ -902,7 +942,7 @@ static void pgm_write_key (char *data, uint32_t len) {
 }
 
 int main(void) {
-        int i;
+        uint32_t i;
         uint32_t lastmsgtock = 0;
 
         //rcc_clock_setup_in_hsi_out_48mhz();
@@ -962,14 +1002,29 @@ int main(void) {
                 __asm__("nop");
 
         lastmsgtock = ticktock + 3000;
+        i = 0;
         while (1) {
                 usbd_poll(usbd_dev);
                 /* TODO: This called each second, put here timeouts for operations
                    TODO: detect "overshooting", as for example signing takes 10+ sec
                    for RSA4096/SHA512
                  */
-                if (ticktock - lastmsgtock > 1000) {
+                if (ticktock - lastmsgtock > 500) {
                         lastmsgtock = ticktock;
+                        if (stick_state == STATE_BLOCKED) {
+                          gpio_toggle(GPIOC, GPIO13);
+                        }
+                        if (stick_state == STATE_PRESIGNBLOCKED && bytes_written) {
+                            if (i < bytes_written * 2) {
+                              gpio_toggle(GPIOC, GPIO13);
+                            } else if (i > bytes_written*2+2) {
+                              i = 0;
+                              gpio_toggle(GPIOC, GPIO13);
+                            }
+                            i++;
+                        } else {
+                          i = 0;
+                        }
                 }
         }
 }

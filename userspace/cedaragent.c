@@ -48,6 +48,7 @@
 #include <time.h>
 #include <limits.h>
 #include <signal.h>
+#include "../firmware/src/common.h"
 
 // https://tools.ietf.org/html/draft-miller-ssh-agent-02#page-3
 // Where "key blob" is the standard public key encoding of the key to be removed.
@@ -77,6 +78,7 @@
 int serfd = -1;
 char sockname[4096];
 int flag_verbose = 0;
+char *askpass = NULL;
 
 /* This is precached _public_ keys, dont worry */
 char *precached_keys[MAX_PRECACHED_KEYS];
@@ -434,6 +436,24 @@ char* unpacklv(char *buf, uint32_t len, uint32_t *chunklen) {
   return(buf+4);
 }
 
+void faskpass(void) {
+  char fullcmd[1024];
+  FILE *fp;
+
+  memset(fullcmd, 0x0, 1024);
+  strcat(fullcmd, askpass);
+  strcat(fullcmd, " \"How many blinks?\"");
+  fp = popen(fullcmd, "r");
+  memset(fullcmd, 0x0, 1024);
+  if ( fp == NULL )
+              return;
+  fullcmd[0] = '\0';
+  if (fgets(fullcmd, sizeof(fullcmd), fp) == NULL)
+        return;
+  write(serfd, fullcmd, 1);
+  fclose(fp);
+}
+
 void answer_signed(int s, char *buf, uint32_t len) {
         uint32_t keyblob_len;
         uint32_t signblob_len;
@@ -489,6 +509,9 @@ void answer_signed(int s, char *buf, uint32_t len) {
 
         // Write command
         write(serfd, "S", 1);
+        if (askpass) {
+          faskpass();
+        }
 
         // type of signature, SHA512 only for now
         write(serfd, &signtype, 1);
@@ -600,6 +623,7 @@ void config_dongle (void) {
         char salt[64];
         unsigned char shainput[128];
         int rnd_dev_fd;
+        uint32_t cfg = 0;
 
         memset(input_stdin, 0x0, 128);
         memset(cfgbuffer, 0x00, 1024); // might be 0xFF?
@@ -609,6 +633,7 @@ void config_dongle (void) {
         if (fgets (input_stdin, 127, stdin) == NULL)
                 exit(1);
         remove_newlines(input_stdin);
+
         //printf("Entered pin: [%s]", input_stdin);
 
         rnd_dev_fd = open("/dev/urandom", O_RDONLY);
@@ -626,6 +651,16 @@ void config_dongle (void) {
         /* Write to config */
         memcpy(&cfgbuffer[4], salt, 64); // write salt
         SHA512(shainput, 128, &cfgbuffer[68]); //write hashed pin
+
+
+        printf("Do you want to use Blinker feature? [y/n]");
+        if (fgets (input_stdin, 127, stdin) == NULL)
+                exit(1);
+        if (input_stdin[0] == 'y') {
+          cfg |= CFG_BIT_BLINKERLOCK;
+        }
+
+        memcpy(cfgbuffer, &cfg, 4);
 
         /* Write 0x1 to start flashing process */
         input_stdin[0] = 0x1;
@@ -647,7 +682,7 @@ void show_help(char **argv) {
         printf("  -x \t\t don't reopen CedarKey automatically, if replugged, exit instead\n");
         printf("  -D \t\t debug, do not daemonize\n");
         printf("  -d \t\t Ask password only once at start, it will be in stick ram until lockout and removed from host memory (disables reopen)\n");
-        printf("  -a path\t\t Path and name to ask pass program (might work: ssh-askpass), will ask pass on each auth\n");
+        printf("  -b path\t\t Path and name to 'ask pass' program (might work: ssh-askpass), will ask pass on each auth if blinker feature enabled\n");
         printf("More information at: https://github.com/nuclearcat/cedarkey\n");
         exit(0);
 }
@@ -664,7 +699,6 @@ int main(int argc, char **argv)
         char *pincode = NULL;
         char *portname = NULL;
         char *keyfilename = NULL;
-        char *askpass = NULL;
         char *password = NULL;
 
         signal(SIGINT, intcleanup);
@@ -679,7 +713,7 @@ int main(int argc, char **argv)
                 precached_keys_len[i] = 0;
         }
 
-        while ((c = getopt (argc, argv, "hns:p:Dw:k:a:v")) != -1) {
+        while ((c = getopt (argc, argv, "hns:p:Dw:k:b:v")) != -1) {
                 switch (c)
                 {
                 case 'h':
@@ -709,8 +743,8 @@ int main(int argc, char **argv)
                 case 'p':
                         pincode = strdup(optarg);
                         break;
-                case 'a':
-                        askpass = strdup(askpass);
+                case 'b':
+                        askpass = strdup(optarg);
                         break;
                 case 'k':
                         keynum = atoi(optarg);
