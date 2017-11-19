@@ -6,18 +6,18 @@ And most important feature i aim to keep footprint small as possible, as result 
 have only 64k flash (officially).
 
 # Q&A
-Q: What is Blinker feature?
-A: On key sign you will be asked for password, you should count blinks on dongle and enter number 1-6. If answer is incorrect - dongle will locks,
+* Q: What is Blinker feature?
+* A: On key sign you will be asked for password, you should count blinks on dongle and enter number 1-6. If answer is incorrect - dongle will locks,
 until you unplug it and plug back. This is semi-replacement of "touch confirmation" as Blue Pill don't have hardware buttons.
 
 # Quickstart (under development)
 ## Required Hardware:
-1.)STM32F103 board with SWD header (for example Blue Pill http://wiki.stm32duino.com/index.php?title=Blue_Pill)
-2.)ST-Link V2 programmer (you can use j-link or others, but they are not covered in quickstart)
-3.)3x female-female wires
+1. STM32F103 board with SWD header (for example Blue Pill http://wiki.stm32duino.com/index.php?title=Blue_Pill)
+2. ST-Link V2 programmer (you can use j-link or others, but they are not covered in quickstart)
+3. 3x female-female wires
 ## Software:
-1.)https://github.com/texane/stlink
-2.)cross-compiler for arm (TODO: which one?)
+1. https://github.com/texane/stlink
+2. cross-compiler for arm (TODO: which one?)
 
 ## Preparing hardware
 ### Connect your stm32f103 board to st-link
