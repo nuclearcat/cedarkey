@@ -311,7 +311,7 @@ int open_port(char *portname, char *pincode, int checkanswer) {
         set_interface_attribs(fd, B115200, 0);
         set_blocking(fd, 0);
         if (pincode) {
-                int unlock_len = strlen(pincode) + 2;
+                int unlock_len = strlen(pincode) + 3; // 2x~ and NULL
                 verbose_printf("[open_port] Entering PIN code\n");
                 buffer = (char*)malloc(unlock_len);
                 sprintf(buffer, "~%s~", pincode);
@@ -464,11 +464,6 @@ void answer_signed(int s, char *buf, uint32_t len) {
         int i;
         char signtype = 0;
 
-        /* Extract key blob length */
-        /* TODO: protect from invalid data length, damned LV/TLV */
-        //memcpy(&keyblob_len, buf, 4);
-        //keyblob_len = ntohl(keyblob_len);
-
         // skip total length header 4b
         keyblob = unpacklv(buf, len, &keyblob_len);
         if (!keyblob) {
@@ -487,8 +482,8 @@ void answer_signed(int s, char *buf, uint32_t len) {
         if (precached_keys_len[0]) {
                 char *idstruct = keyblob;
                 uint32_t idlen;
-                memcpy(&idlen, keyblob, 4);
-                if (ntohl(idlen) == 7 && !memcmp(idstruct+4, "ssh-rsa", 7)) {
+                unpacklv(keyblob, keyblob_len, &idlen);
+                if (idlen == 7 && !memcmp(idstruct+4, "ssh-rsa", 7)) {
                         verbose_printf("[answer_signed] searching in cached keys\n");
                         for (i=0; precached_keys_len[i]; i++) {
                                 if (keyblob_len == precached_keys_len[i]-4 && !memcmp(keyblob, precached_keys[i]+4, precached_keys_len[i]-4)) {

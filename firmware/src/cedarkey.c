@@ -277,7 +277,7 @@ static int blinker_random (void) {
   unsigned char* salt_ptr= (unsigned char*)start_address+CFG_SALT_OFFSET;
   memcpy(tmpbuf, salt_ptr, 64);
   memcpy(&tmpbuf[64], &ticktock_now, 4);
-  mbedtls_sha256((unsigned char*)bigbuf, 128, hash, 0);
+  mbedtls_sha256((unsigned char*)tmpbuf, 128, hash, 0);
   if ((hash[0] % 6) == 0)
     return(6);
   else
