@@ -22,6 +22,8 @@ And most important feature i aim to keep firmware size small as possible, as res
 * GND to GND
 * DCLK to DCLK
 * DIO to DIO
+
+
 Small visual guide exist in wiki: https://github.com/nuclearcat/cedarkey/wiki
 
 
