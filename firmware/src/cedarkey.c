@@ -651,7 +651,9 @@ static void feed_rx_data(char byte) {
                 bigbuf[bytes_written] = byte;
                 bytes_written++;
                 if (bytes_written == 1024) {
-                        //stick_state = STATE_UNLOCKING;
+                        /* TODO: hash salt with current ticktock+ADC? to make it more secret
+                           in case it was intercepted on initial configuration
+                        */
                         stick_state = STATE_DEFAULT;
                         password = malloc(65);
                         memset(password, 0x0, 65);
@@ -659,7 +661,6 @@ static void feed_rx_data(char byte) {
                         bytes_written = 0;
                         free(bigbuf);
                         bigbuf = NULL;
-
                 }
                 break;
         /* Write key to flash TODO: verify it with parse after writing? */
