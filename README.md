@@ -35,7 +35,7 @@ Small visual guide exist in wiki: https://github.com/nuclearcat/cedarkey/wiki
 
 ### Compiling firmware
 * git submodule update --init
-* cd firmware/opencm3
+* cd firmware/libopencm3
 * make
 * cd ../src
 * make cedarkey.bin
