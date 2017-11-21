@@ -197,7 +197,7 @@ print-%:
 
 %.o: %.c
 	@#printf "  CC      $(*).c\n"
-	$(Q)$(CC) $(TGT_CFLAGS) $(CFLAGS) $(TGT_CPPFLAGS) $(CPPFLAGS) -o $(*).o -c $(*).c
+	$(Q)$(CC) $(TGT_CFLAGS) $(CFLAGS) $(TGT_CPPFLAGS) $(CPPFLAGS) -o $@ -c $<
 
 %.o: %.cxx
 	@#printf "  CXX     $(*).cxx\n"

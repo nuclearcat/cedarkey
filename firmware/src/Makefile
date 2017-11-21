@@ -16,9 +16,19 @@
 ## You should have received a copy of the GNU Lesser General Public License
 ## along with this library.  If not, see <http://www.gnu.org/licenses/>.
 ##
-
+CFLAGS  += -I.
 BINARY = cedarkey
-OBJS = entropy.o sha512.o entropy_poll.o timing.o ctr_drbg.o pk_wrap.o pk.o pkparse.o bignum.o asn1parse.o oid.o ecp.o pkcs12.o pem.o md.o arc4.o md5.o cipher.o pkcs5.o des.o aes.o base64.o cipher_wrap.o camellia.o blowfish.o ccm.o gcm.o md_wrap.o ripemd160.o sha1.o sha256.o rsa.o error.o x509.o x509_crt.o
+
+VPATH += ../../mbedtls/library
+
+
+OBJS = entropy.o sha512.o entropy_poll.o timing.o ctr_drbg.o 
+OBJS += pk_wrap.o pk.o pkparse.o bignum.o asn1parse.o oid.o 
+OBJS += ecp.o pkcs12.o pem.o md.o arc4.o md5.o cipher.o pkcs5.o 
+OBJS += des.o aes.o base64.o cipher_wrap.o camellia.o blowfish.o 
+OBJS += ccm.o gcm.o md_wrap.o ripemd160.o sha1.o sha256.o rsa.o 
+OBJS += error.o x509.o x509_crt.o
+
 
 LDSCRIPT = ../stm32-h103.ld
 
