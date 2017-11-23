@@ -99,6 +99,7 @@ char *startup_askpass = NULL;
 struct termios saved_attributes;
 int agent_clients[MAXAGENTCLIENTS];
 int agent_clients_num = 0;
+int iotimeout = 0;
 // IMPORTANT TODO: as serial non-blocking, make write properly, with verifying return code
 
 /* This is precached _public_ keys, dont worry */
@@ -235,6 +236,7 @@ int readexactly(int fd, int howmuch, char *buf) {
         fd_set rfds;
         int n;
         int bytesdone = 0;
+        time_t started = time(NULL);
 
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
@@ -243,16 +245,21 @@ int readexactly(int fd, int howmuch, char *buf) {
                         n = read(fd, &buf[bytesdone], 1);
                         if (n <= 0) {
                                 // TODO: show errno
-                                perror("[read error] ");
+                                if (flag_verbose)
+                                  perror("[read error] ");
                                 return(-1);
                         }
                         bytesdone += n;
                         if (bytesdone == howmuch)
                                 return(0);
                 } else {
-                        perror("[select error] ");
+                        if (flag_verbose)
+                          perror("[select error] ");
                         return(-1); // error happened
                 }
+                // If iotimeout set - we have deadline for I/O
+                if (iotimeout && time(NULL) - started > iotimeout)
+                  return(-1);
         }
         return(0);
 }
@@ -296,7 +303,7 @@ int set_interface_attribs (int fd, int speed, int parity) {
 }
 
 
-void precache_keys(void) {
+int precache_keys(void) {
         int i;
         uint32_t len;
         char switchkey[] = "X0";
@@ -320,18 +327,18 @@ void precache_keys(void) {
                 switchkey[1] = '0' + i;
                 write_wrapper(serfd, switchkey, 2);
                 if (readexactly(serfd, 1, answer) < 0)
-                        return;
+                        return(-1);
                 verbose_printf("Switched key %d\n", i);
                 write_wrapper(serfd, loadpubkey, 1);
                 if (readexactly(serfd, 4, keybuf) < 0)
-                        return;
+                        return(-1);
                 memcpy(&len, keybuf, 4);
                 len = ntohl(len);
                 verbose_printf("Signature length %d\n", len);
                 if (len >= 4096 || len == 0)
                         break;
                 if (readexactly(serfd, len, &keybuf[4]) < 0)
-                        return;
+                        return(-1);
                 len += 4;
                 precached_keys[i] = (char*)malloc(len);
                 precached_keys_len[i] = len;
@@ -343,7 +350,8 @@ void precache_keys(void) {
         switchkey[1] = '0';
         write_wrapper(serfd, switchkey, 2);
         if (readexactly(serfd, 1, answer) < 0)
-                return;
+                return(-1);
+        return(0);
 }
 
 int open_port(char *portname, char *pincode, int checkanswer) {
@@ -661,7 +669,8 @@ void answer_identities(int s) {
         }
 
         verbose_printf("[answer_identities] RECEIVING %d bytes\n", total);
-        readexactly(serfd, total, (char *)buffer); /* TODO: smart way readying with len */
+        if (readexactly(serfd, total, (char *)buffer) < 0)
+          return;
         verbose_printf("[answer_identities] KEYS RECEIVED\n");
         /* Number of keys field */
         {
@@ -798,21 +807,17 @@ void dongle_keywrite(char *keyfilename) {
         for (int x=0; x<32; x++) {
                 sum += key[x];
         }
-        printf("KeySum %02hhx\n", sum % 256);
         for (int x=0; x<16; x++) {
                 sum += iv[x];
         }
-        printf("Key+IVSum %02hhx\n", sum % 256);
 
 
         // Rounding to 32 byte
         tocrypt_sz = offset-KEYSRC_SZ-IV_SZ;
 
         if (tocrypt_sz % 32 != 0) {
-                verbose_printf("Rounding to 32, before %d ", tocrypt_sz);
                 offset += 32 - (tocrypt_sz % 32); // update it too as it represents total size
                 tocrypt_sz = (tocrypt_sz + 32 - (tocrypt_sz % 32));
-                verbose_printf("now %d\n", tocrypt_sz);
         }
 
         /* Copy unencrypted header, salt for aes key and IV */
@@ -836,27 +841,22 @@ void dongle_keywrite(char *keyfilename) {
         uint32_t offset_norder = htonl(offset);
         write_wrapper(serfd, &offset_norder, 4);
         verbose_printf("[writing_key] Data length %d sent\n", offset);
-        readexactly(serfd, 1, wrbuf); // read Y
-        verbose_printf("[writing_key] Return code %c\n", wrbuf[0]);
-        readexactly(serfd, 1, wrbuf); // read Y
-        verbose_printf("[writing_key] Return code %c\n", wrbuf[0]);
-        readexactly(serfd, 1, wrbuf); // read Y
-        verbose_printf("[writing_key] Return code %c\n", wrbuf[0]);
-        readexactly(serfd, 1, wrbuf); // read Y
-        verbose_printf("[writing_key] Return code %c\n", wrbuf[0]);
 
 
-        printf("KeySRC0 %02hhx\n", keybuf[0]);
-        printf("KeyIV %02hhx\n", keybuf[KEYSRC_SZ]);
         for (int i=0; i<offset; i++) {
                 write_wrapper(serfd, &keybuf[i], 1);
-                readexactly(serfd, 1, wrbuf); // read Y
-                verbose_printf("[writing_key] Written %d byte[%02hhx], return code %c\n", i, keybuf[i], wrbuf[0]);
+                if (readexactly(serfd, 1, wrbuf) < 0) {
+                  printf("[writing_key] Key is NOT written. Error, confirmation of byte %d from total %lu not received\n", i, offset);
+                  exit(0);
+                }
+
         }
 
-        verbose_printf("[writing_key] Key is written\n");
-        readexactly(serfd, 1, wrbuf);
-        verbose_printf("[writing_key] Return code %c\n", wrbuf[0]);
+        if (readexactly(serfd, 1, wrbuf) < 0) {
+          printf("[writing_key] Final confirmation not received, key probably not written correctly!\n");
+        } else {
+          printf("[writing_key] Key is written\n");
+        }
         exit(0);
 }
 
@@ -967,14 +967,14 @@ void remove_agentclient(int s2) {
 int handle_agentclient_data(int s2, int keynum) {
           char buf[65536];
           struct agent_msghdr agentmsg_begin;
-          if (readexactly(s2, 5, buf)) {
+          if (readexactly(s2, 5, buf) < 0) {
                   remove_agentclient(s2);
                   return(-1);
           }
           memcpy(&agentmsg_begin, buf, 5);
           agentmsg_begin.message_len = ntohl(agentmsg_begin.message_len);
           if (agentmsg_begin.message_len > 1) {
-                  if (readexactly(s2, agentmsg_begin.message_len-1, buf)) {
+                  if (readexactly(s2, agentmsg_begin.message_len-1, buf) < 0) {
                           remove_agentclient(s2);
                           return(-1);
                   }
@@ -1104,13 +1104,22 @@ int main(int argc, char **argv)
         }
 
         if (keynum == -1 && !keyfilename) {
-                precache_keys();
+                iotimeout = 15;
+                if (precache_keys()) {
+                  printf("Error during key precaching, exiting\n");
+                }
+                iotimeout = 0;
         } else {
                 char switchkey[] = "X0";
                 if (keynum > 0 && keynum < 30)
                         switchkey[1] = '0' + keynum;
                 write_wrapper(serfd, switchkey, 2);
-                readexactly(serfd, 1, switchkey);
+                iotimeout = 3;
+                if (readexactly(serfd, 1, switchkey) < 0) {
+                  printf("Can't switch key, exiting\n");
+                  exit(0);
+                }
+                iotimeout = 0;
                 verbose_printf("Switched\n");
         }
 
@@ -1167,13 +1176,21 @@ int main(int argc, char **argv)
                                 usleep(1000);
                                 continue;
                         }
-                        if (keynum == -1)
-                                precache_keys();
-                        else {
+                        if (keynum == -1) {
+                                if (precache_keys()) {
+                                  verbose_printf("Error while trying to precache keys, closing device\n");
+                                  close(serfd);
+                                  serfd = -1;
+                                }
+                        } else {
                                 char switchkey[] = "X0";
                                 switchkey[1] = '0' + keynum;
                                 write_wrapper(serfd, switchkey, 2);
-                                readexactly(serfd, 1, switchkey);
+                                if (readexactly(serfd, 1, switchkey) < 0) {
+                                  verbose_printf("Key switching error, closing device\n");
+                                  close(serfd);
+                                  serfd = -1;
+                                }
                         }
                 }
 
@@ -1186,12 +1203,14 @@ int main(int argc, char **argv)
                         serfd = -1;
                         continue;
                 }
+                iotimeout = 30;
                 for (int i=0;i<MAXAGENTCLIENTS;i++) {
                   if (agent_clients[i] != -1 && isready(agent_clients[i], 0)) {
-                    printf("Handling data from agent client\n");
+                    verbose_printf("Handling data from agent client\n");
                     handle_agentclient_data(agent_clients[i],keynum);
                   }
                 };
+                iotimeout = 0;
 
                 // Anything on main unix socket? If not, keep looping and checking serial state
                 if (!isready(s, 1)) {
