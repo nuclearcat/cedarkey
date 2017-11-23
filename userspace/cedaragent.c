@@ -89,6 +89,7 @@
 #define MAX_PRECACHED_KEYS 16
 /* including null */
 #define VERLEN 6
+#define MAXAGENTCLIENTS 128
 
 int serfd = -1;
 char sockname[4096];
@@ -96,7 +97,8 @@ int flag_verbose = 0;
 char *blinky_askpass = NULL;
 char *startup_askpass = NULL;
 struct termios saved_attributes;
-
+int agent_clients[MAXAGENTCLIENTS];
+int agent_clients_num = 0;
 // IMPORTANT TODO: as serial non-blocking, make write properly, with verifying return code
 
 /* This is precached _public_ keys, dont worry */
@@ -108,6 +110,15 @@ struct __attribute__((__packed__)) agent_msghdr {
         uint8_t message_type;
         uint8_t message_contents[];
 };
+
+void verbose_printf( const char* format, ... ) {
+        va_list args;
+        if (!flag_verbose)
+                return;
+        va_start( args, format );
+        vfprintf( stdout, format, args );
+        va_end( args );
+}
 
 void stdin_reset (void) {
         tcsetattr (STDIN_FILENO, TCSANOW, &saved_attributes);
@@ -154,6 +165,7 @@ void fncleanup (void) {
 }
 
 void intcleanup(int dummy) {
+        verbose_printf("Cleanup done\n");
         exit(0);
 }
 
@@ -179,16 +191,6 @@ void rewritefile(char *name, char *buf, int len) {
         int wfd = open(name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
         write_wrapper(wfd, buf, len);
         close(wfd);
-}
-
-
-void verbose_printf( const char* format, ... ) {
-        va_list args;
-        if (!flag_verbose)
-                return;
-        va_start( args, format );
-        vfprintf( stdout, format, args );
-        va_end( args );
 }
 
 void rand_str(char *dest, size_t length) {
@@ -517,7 +519,6 @@ void faskpass_startup(void) {
         memset(fullcmd, 0x0, 1024);
         if ( fp == NULL )
                 return;
-        fullcmd[0] = '\0';
         if (fgets(fullcmd, sizeof(fullcmd), fp) == NULL)
                 return;
         remove_newlines(fullcmd);
@@ -721,7 +722,7 @@ void dongle_keywrite(char *keyfilename) {
         offset += IV_SZ;
 
         stdin_disable_echo(0);
-        printf("Key decryption password (press enter if none):\r\n");
+        printf("Key decryption password:\r\n");
         if (fgets (input_stdin, 127, stdin) == NULL)
                 exit(1);
         stdin_reset();
@@ -930,11 +931,78 @@ void show_help(char **argv) {
         exit(0);
 }
 
+void add_agentclient(int s2) {
+  int i;
+  for (i=0;i<MAXAGENTCLIENTS;i++) {
+    if (agent_clients[i] == -1) {
+      agent_clients[i] = s2;
+      agent_clients_num++;
+      break;
+    }
+  }
+  // no more space
+  if (i==MAXAGENTCLIENTS) {
+    close(s2);
+  }
+}
+
+void remove_agentclient(int s2) {
+  int i;
+  verbose_printf("Removing agent client\n");
+  for (i=0;i<MAXAGENTCLIENTS;i++) {
+    if (agent_clients[i] == s2) {
+      agent_clients[i] = -1;
+      agent_clients_num--;
+      break;
+    }
+  }
+  // no more space
+  if (i==MAXAGENTCLIENTS) {
+    printf("Trying to remove nonexisting client socket?\n");
+    exit(1);
+  }
+}
+
+
+int handle_agentclient_data(int s2, int keynum) {
+          char buf[65536];
+          struct agent_msghdr agentmsg_begin;
+          if (readexactly(s2, 5, buf)) {
+                  remove_agentclient(s2);
+                  return(-1);
+          }
+          memcpy(&agentmsg_begin, buf, 5);
+          agentmsg_begin.message_len = ntohl(agentmsg_begin.message_len);
+          if (agentmsg_begin.message_len > 1) {
+                  if (readexactly(s2, agentmsg_begin.message_len-1, buf)) {
+                          remove_agentclient(s2);
+                          return(-1);
+                  }
+          }
+          /* TODO: implement more :) */
+          switch(agentmsg_begin.message_type) {
+          case SSH_AGENTC_REQUEST_IDENTITIES:
+                  if (keynum == -1)
+                          answer_cached_identities(s2);
+                  else
+                          answer_identities(s2);
+                  break;
+          case SSH_AGENTC_SIGN_REQUEST:
+                  answer_signed(s2, buf, agentmsg_begin.message_len-1);
+                  break;
+          default:
+                  verbose_printf("Unknown action requested %d\n", agentmsg_begin.message_type);
+                  answer_fail(s2);
+                  break;
+          }
+          return(0);
+}
+
+
 int main(int argc, char **argv)
 {
         int s, s2, t;
         struct sockaddr_un local, remote;
-        char buf[65536];
         int c;
         int flag_cfgnew = 0, flag_reopen = 1, flag_daemon = 1;
         int keynum = -1;
@@ -942,7 +1010,6 @@ int main(int argc, char **argv)
         char *pincode = NULL;
         char *portname = NULL;
         char *keyfilename = NULL;
-        char *password = NULL;
 
         signal(SIGINT, intcleanup);
 
@@ -956,6 +1023,8 @@ int main(int argc, char **argv)
                 precached_keys[i] = NULL;
                 precached_keys_len[i] = 0;
         }
+        for (int i = 0; i < MAXAGENTCLIENTS; i++)
+          agent_clients[i] = -1;
 
         while ((c = getopt (argc, argv, "hns:p:Dw:k:b:a:v")) != -1) {
                 switch (c)
@@ -974,9 +1043,6 @@ int main(int argc, char **argv)
                         break;
                 case 'v':
                         flag_verbose = 1;
-                        break;
-                case 'd':
-                        password = strdup(optarg);
                         break;
                 case 'w':
                         keyfilename = strdup(optarg);
@@ -1048,19 +1114,6 @@ int main(int argc, char **argv)
                 verbose_printf("Switched\n");
         }
 
-        /* If password is set, give to dongle and erase it
-           Problem: reconnecting dongle wont work
-         */
-        if (password) {
-                write_wrapper(serfd, "P", 1);
-                write_wrapper(serfd, password, strlen(password));
-                write_wrapper(serfd, "~", 1);
-                memset(password, 0x0, strlen(password));
-                free(password);
-                password = NULL;
-                flag_reopen = 0;
-        }
-
         time_seed();
         rand_str(rndpart, 8);
 
@@ -1095,7 +1148,7 @@ int main(int argc, char **argv)
                 exit(1);
         }
 
-        if (listen(s, 1) == -1) {
+        if (listen(s, 100) == -1) {
                 perror("listen");
                 exit(1);
         }
@@ -1133,48 +1186,26 @@ int main(int argc, char **argv)
                         serfd = -1;
                         continue;
                 }
+                for (int i=0;i<MAXAGENTCLIENTS;i++) {
+                  if (agent_clients[i] != -1 && isready(agent_clients[i], 0)) {
+                    printf("Handling data from agent client\n");
+                    handle_agentclient_data(agent_clients[i],keynum);
+                  }
+                };
 
-                // Anything on unix socket? If not, keep looping and checking serial state
+                // Anything on main unix socket? If not, keep looping and checking serial state
                 if (!isready(s, 1)) {
                         usleep(1);
                         continue;
-                }
-
-                t = sizeof(remote);
-                if ((s2 = accept(s, (struct sockaddr *)&remote, (socklen_t *)&t)) == -1) {
+                } else {
+                  t = sizeof(remote);
+                  if ((s2 = accept(s, (struct sockaddr *)&remote, (socklen_t *)&t)) == -1) {
                         perror("accept");
                         exit(1);
+                  }
+                  verbose_printf("New agent client...\n");
+                  add_agentclient(s2);
                 }
-
-                while (1) {
-                        struct agent_msghdr agentmsg_begin;
-                        if (readexactly(s2, 5, buf)) {
-                                break;
-                        }
-                        memcpy(&agentmsg_begin, buf, 5);
-                        agentmsg_begin.message_len = ntohl(agentmsg_begin.message_len);
-                        if (agentmsg_begin.message_len > 1) {
-                                if (readexactly(s2, agentmsg_begin.message_len-1, buf)) {
-                                        break;
-                                }
-                        }
-                        /* TODO: implement more :) */
-                        switch(agentmsg_begin.message_type) {
-                        case SSH_AGENTC_REQUEST_IDENTITIES:
-                                if (keynum == -1)
-                                        answer_cached_identities(s2);
-                                else
-                                        answer_identities(s2);
-                                break;
-                        case SSH_AGENTC_SIGN_REQUEST:
-                                answer_signed(s2, buf, agentmsg_begin.message_len-1);
-                                break;
-                        default:
-                                answer_fail(s2);
-                                break;
-                        }
-                }
-                close(s2);
         }
 
         return 0;
