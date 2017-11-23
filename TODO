@@ -1,0 +1,2 @@
+Make short report for top functions size on compile?
+nm -S --size-sort -t d cedarkey.elf

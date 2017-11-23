@@ -49,11 +49,24 @@
 #include <limits.h>
 #include <signal.h>
 #include "../firmware/src/common.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/rsa.h"
+#include "mbedtls/aes.h"
+#include "mbedtls/error.h"
+#include "mbedtls/sha256.h"
+#include "mbedtls/sha512.h"
+//#include "mbedtls/pk.h"
+
 
 // https://tools.ietf.org/html/draft-miller-ssh-agent-02#page-3
 // Where "key blob" is the standard public key encoding of the key to be removed.
 // SSH protocol key encodings are defined in [RFC4253] for "ssh-rsa" and "ssh-dss" keys,
 // in [RFC5656] for "ecdsa-sha2-*" keys and in [I-D.ietf-curdle-ssh-ed25519] for "ssh-ed25519" keys.
+
+// We store just N, E, P and Q encrypted by CBC, instead of PEM/DER, because parser is too fat for STM32F1
+// Also: https://tls.mbed.org/kb/development/how-to-fill-rsa-context-from-n-e-p-and-q
+// https://tls.mbed.org/kb/how-to/encrypt-with-aes-cbc
+
 #define SSH_AGENTC_REQUEST_IDENTITIES                  11
 #define SSH_AGENTC_SIGN_REQUEST                        13
 #define SSH_AGENTC_ADD_IDENTITY                        17
@@ -74,11 +87,17 @@
 #define SSH_AGENT_IDENTITIES_ANSWER                     12
 
 #define MAX_PRECACHED_KEYS 16
+/* including null */
+#define VERLEN 6
 
 int serfd = -1;
 char sockname[4096];
 int flag_verbose = 0;
-char *askpass = NULL;
+char *blinky_askpass = NULL;
+char *startup_askpass = NULL;
+struct termios saved_attributes;
+
+// IMPORTANT TODO: as serial non-blocking, make write properly, with verifying return code
 
 /* This is precached _public_ keys, dont worry */
 char *precached_keys[MAX_PRECACHED_KEYS];
@@ -90,8 +109,42 @@ struct __attribute__((__packed__)) agent_msghdr {
         uint8_t message_contents[];
 };
 
+void stdin_reset (void) {
+        tcsetattr (STDIN_FILENO, TCSANOW, &saved_attributes);
+}
+
+void stdin_disable_echo (int justsave) {
+        struct termios tattr;
+
+        /* Make sure stdin is a terminal. */
+        if (!isatty (STDIN_FILENO)) {
+                fprintf (stderr, "Not a terminal.\n");
+                exit (EXIT_FAILURE);
+        }
+
+        /* Save the terminal attributes so we can restore them later. */
+        tcgetattr (STDIN_FILENO, &saved_attributes);
+        if (justsave)
+          return;
+        /* Set the funny terminal modes. */
+        tcgetattr (STDIN_FILENO, &tattr);
+        tattr.c_lflag &= ~(ICANON | ECHO); /* Clear ICANON and ECHO. */
+        tattr.c_cc[VMIN] = 1;
+        tattr.c_cc[VTIME] = 0;
+        tcsetattr (STDIN_FILENO, TCSAFLUSH, &tattr);
+}
+
+void remove_newlines(char *data) {
+        char *pos;
+        if ((pos=strchr(data, '\r')) != NULL)
+                *pos = '\0';
+        if ((pos=strchr(data, '\n')) != NULL)
+                *pos = '\0';
+}
+
 /* Keep disk space clean if killed, because we create sockets in home directory */
 void fncleanup (void) {
+        stdin_reset();
         if (sockname[0])
                 unlink(sockname);
         /* Lock dongle! */
@@ -103,21 +156,35 @@ void intcleanup(int dummy) {
         exit(0);
 }
 
+int write_wrapper(int fd, void *buf, int len) {
+        uint32_t written = 0;
+        char *wrbuf = buf;
+        int ret;
+        while (written != len) {
+                ret = write(fd, &wrbuf[written], 1);
+                if (ret > 0) {
+                        written += ret;
+                } else {
+                        perror("write error");
+                }
+        }
+        return(len);
+}
 
-   // Debugging function
-   void rewritefile(char *name, char *buf, int len) {
+
+// Debugging function
+void rewritefile(char *name, char *buf, int len) {
         unlink(name);
         int wfd = open(name, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-        write(wfd, buf, len);
+        write_wrapper(wfd, buf, len);
         close(wfd);
-   }
-
+}
 
 
 void verbose_printf( const char* format, ... ) {
         va_list args;
         if (!flag_verbose)
-          return;
+                return;
         va_start( args, format );
         vfprintf( stdout, format, args );
         va_end( args );
@@ -201,14 +268,11 @@ int set_interface_attribs (int fd, int speed, int parity) {
         cfsetispeed (&tty, speed);
 
         tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;     // 8-bit chars
-        // disable IGNBRK for mismatched speed tests; otherwise receive break
-        // as \000 chars
-        tty.c_iflag &= ~IGNBRK;         // disable break processing
         tty.c_lflag = 0;                // no signaling chars, no echo,
                                         // no canonical processing
         tty.c_oflag = 0;                // no remapping, no delays
         tty.c_cc[VMIN]  = 0;            // read doesn't block
-        tty.c_cc[VTIME] = 5;            // 0.5 seconds read timeout
+        tty.c_cc[VTIME] = 0;            // 0.5 seconds read timeout
 
         tty.c_iflag &= ~(IXON | IXOFF | IXANY); // shut off xon/xoff ctrl
 
@@ -218,6 +282,7 @@ int set_interface_attribs (int fd, int speed, int parity) {
         tty.c_cflag |= parity;
         tty.c_cflag &= ~CSTOPB;
         tty.c_cflag &= ~CRTSCTS;
+        tty.c_iflag = 0;
 
         if (tcsetattr (fd, TCSANOW, &tty) != 0)
         {
@@ -226,6 +291,7 @@ int set_interface_attribs (int fd, int speed, int parity) {
         }
         return 0;
 }
+
 
 void precache_keys(void) {
         int i;
@@ -245,14 +311,15 @@ void precache_keys(void) {
                         }
                 }
         }
+
         /* Valid keys have to be written sequentally TODO: ? */
         for (i=0; i<MAX_PRECACHED_KEYS; i++) {
                 switchkey[1] = '0' + i;
-                write(serfd, switchkey, 2);
+                write_wrapper(serfd, switchkey, 2);
                 if (readexactly(serfd, 1, answer) < 0)
                         return;
                 verbose_printf("Switched key %d\n", i);
-                write(serfd, loadpubkey, 1);
+                write_wrapper(serfd, loadpubkey, 1);
                 if (readexactly(serfd, 4, keybuf) < 0)
                         return;
                 memcpy(&len, keybuf, 4);
@@ -271,29 +338,11 @@ void precache_keys(void) {
 
         /* switch back to 0 key, not essential but needed for development */
         switchkey[1] = '0';
-        write(serfd, switchkey, 2);
+        write_wrapper(serfd, switchkey, 2);
         if (readexactly(serfd, 1, answer) < 0)
                 return;
 }
 
-void set_blocking (int fd, int should_block) {
-        struct termios tty;
-        memset (&tty, 0, sizeof tty);
-        if (tcgetattr (fd, &tty) != 0)
-        {
-                printf ("error %d from tggetattr", errno);
-                return;
-        }
-
-        tty.c_cc[VMIN]  = should_block ? 1 : 0;
-        tty.c_cc[VTIME] = 50;
-        cfmakeraw(&tty);
-        if (tcsetattr (fd, TCSANOW, &tty) != 0)
-                printf ("error %d setting term attributes", errno);
-}
-
-/* including null */
-#define VERLEN 6
 int open_port(char *portname, char *pincode, int checkanswer) {
         int fd; /* File descriptor for the port */
         int ret;
@@ -309,13 +358,13 @@ int open_port(char *portname, char *pincode, int checkanswer) {
         fcntl(fd, F_SETFL, O_RDWR);
 
         set_interface_attribs(fd, B115200, 0);
-        set_blocking(fd, 0);
+
         if (pincode) {
                 int unlock_len = strlen(pincode) + 3; // 2x~ and NULL
                 verbose_printf("[open_port] Entering PIN code\n");
                 buffer = (char*)malloc(unlock_len);
                 sprintf(buffer, "~%s~", pincode);
-                ret = write(fd, buffer, unlock_len);
+                ret = write_wrapper(fd, buffer, unlock_len);
                 free(buffer);
                 if (ret != unlock_len) {
                         return(-1);
@@ -323,7 +372,7 @@ int open_port(char *portname, char *pincode, int checkanswer) {
         }
         if (checkanswer) {
                 verbose_printf("[open_port] Checking dongle version\n");
-                ret = write(fd, "V", 1);
+                ret = write_wrapper(fd, "V", 1);
                 memset(verstring, 0x0, VERLEN);
                 if (readexactly(fd, VERLEN-1, verstring) < 0) {
                         printf("Dongle not ready\n");
@@ -420,39 +469,64 @@ void packdata_final(struct packdata *original, uint8_t cmdcode) {
 }
 
 void answer_fail(int s) {
-  struct packdata *pd = packdata_new();
-  packdata_final(pd, SSH_AGENT_FAILURE);
-  write(s, pd->buffer, pd->len);
-  packdata_del(pd);
+        struct packdata *pd = packdata_new();
+        packdata_final(pd, SSH_AGENT_FAILURE);
+        write_wrapper(s, pd->buffer, pd->len);
+        packdata_del(pd);
 }
 
 char* unpacklv(char *buf, uint32_t len, uint32_t *chunklen) {
-  if (len < 4)
-    return(NULL);
-  memcpy(chunklen, buf, 4);
-  *chunklen = htonl(*chunklen);
-  if (len <= *chunklen+4)
-    return(NULL);
-  return(buf+4);
+        if (len < 4)
+                return(NULL);
+        memcpy(chunklen, buf, 4);
+        *chunklen = htonl(*chunklen);
+        if (len <= *chunklen+4)
+                return(NULL);
+        return(buf+4);
 }
 
-void faskpass(void) {
-  char fullcmd[1024];
-  FILE *fp;
+void faskpass_blinky(void) {
+        char fullcmd[1024];
+        FILE *fp;
 
-  memset(fullcmd, 0x0, 1024);
-  strcat(fullcmd, askpass);
-  strcat(fullcmd, " \"How many blinks?\"");
-  fp = popen(fullcmd, "r");
-  memset(fullcmd, 0x0, 1024);
-  if ( fp == NULL )
-              return;
-  fullcmd[0] = '\0';
-  if (fgets(fullcmd, sizeof(fullcmd), fp) == NULL)
-        return;
-  write(serfd, fullcmd, 1);
-  fclose(fp);
+        memset(fullcmd, 0x0, 1024);
+        strcat(fullcmd, blinky_askpass);
+        strcat(fullcmd, " \"How many blinks?\"");
+        fp = popen(fullcmd, "r");
+        memset(fullcmd, 0x0, 1024);
+        if ( fp == NULL )
+                return;
+        fullcmd[0] = '\0';
+        if (fgets(fullcmd, sizeof(fullcmd), fp) == NULL)
+                return;
+        write_wrapper(serfd, fullcmd, 1);
+        fclose(fp);
 }
+
+void faskpass_startup(void) {
+        char fullcmd[1024];
+        FILE *fp;
+        char pass_cmd[] = "P";
+        char pass_end[] = "~";
+
+        memset(fullcmd, 0x0, 1024);
+        strcat(fullcmd, startup_askpass);
+        strcat(fullcmd, " \"Keys unlock password?\"");
+        fp = popen(fullcmd, "r");
+        memset(fullcmd, 0x0, 1024);
+        if ( fp == NULL )
+                return;
+        fullcmd[0] = '\0';
+        if (fgets(fullcmd, sizeof(fullcmd), fp) == NULL)
+                return;
+        remove_newlines(fullcmd);
+        write_wrapper(serfd, pass_cmd, 1);
+        write_wrapper(serfd, fullcmd, strlen(fullcmd));
+        write_wrapper(serfd, pass_end, 1);
+        memset(fullcmd, 0x0, sizeof(fullcmd));
+        fclose(fp);
+}
+
 
 void answer_signed(int s, char *buf, uint32_t len) {
         uint32_t keyblob_len;
@@ -460,24 +534,23 @@ void answer_signed(int s, char *buf, uint32_t len) {
         uint8_t buffer[8192]; // TODO: dynamic
         struct packdata *pd = packdata_new();
         char *keyblob, *signblob;
-        //char *dataforsign_ptr;
         int i;
         char signtype = 0;
 
         // skip total length header 4b
         keyblob = unpacklv(buf, len, &keyblob_len);
         if (!keyblob) {
-          printf("Keyblob invalid\n");
-          return;
+                printf("[answer_signed] Keyblob invalid\n");
+                return;
         }
-
 
         signblob = unpacklv(keyblob+keyblob_len, len-keyblob_len, &signblob_len);
         if (!signblob) {
-          printf("Signature invalid\n");
-          return;
+                printf("[answer_signed] Signature invalid\n");
+                return;
+        } else {
+                verbose_printf("[answer_signed] DATA to sign %db\n", signblob_len);
         }
-
 
         if (precached_keys_len[0]) {
                 char *idstruct = keyblob;
@@ -490,7 +563,7 @@ void answer_signed(int s, char *buf, uint32_t len) {
                                         verbose_printf("[signing] match for key %d\n", i);
                                         char switchkey[] = "X0";
                                         switchkey[1] = '0' + i;
-                                        write(serfd, switchkey, 2);
+                                        write_wrapper(serfd, switchkey, 2);
                                         if (readexactly(serfd, 1, switchkey) < 0)
                                                 return;
                                         break;
@@ -503,29 +576,31 @@ void answer_signed(int s, char *buf, uint32_t len) {
         }
 
         // Write command
-        write(serfd, "S", 1);
-        if (askpass) {
-          faskpass();
+        write_wrapper(serfd, "S", 1);
+
+        if (blinky_askpass) {
+                faskpass_blinky();
         }
 
         // type of signature, SHA512 only for now
-        write(serfd, &signtype, 1);
+        write_wrapper(serfd, &signtype, 1);
 
         // Write signblob together with length header
         verbose_printf("[answer_signed] PROVIDING DATA TO BE SIGNED\n");
         for (uint32_t i=0; i<signblob_len+4; i++) {
-                write(serfd, signblob-4+i, 1);
+                write_wrapper(serfd, signblob-4+i, 1);
         }
 
         verbose_printf("[answer_signed] READING SIGNED DATA HEADER 4b\n");
         for (int i = 0; i<4; i++) {
-                read(serfd, &buffer[i], 1);
+                while (read(serfd, &buffer[i], 1) != 1) ;
         }
+
         int total = ntohl(*((uint32_t*)buffer));
         verbose_printf("[answer_signed] READING SIGNED DATA REMAINDER %db\n", total);
 
         for (int i = 4; i<total+4; i++) {
-                read(serfd, &buffer[i], 1);
+                while(read(serfd, &buffer[i], 1) != 1) ;
         }
 
         pd = packdata_new();
@@ -538,7 +613,7 @@ void answer_signed(int s, char *buf, uint32_t len) {
         }
         packdata_envelope(pd);
         packdata_final(pd, SSH_AGENT_SIGN_RESPONSE);
-        write(s, pd->buffer, pd->len);
+        write_wrapper(s, pd->buffer, pd->len);
         packdata_del(pd);
 }
 
@@ -555,7 +630,6 @@ void answer_cached_identities(int s) {
                 sprintf(comment, "hwkey%d", i);
                 packdata_extend(pd, precached_keys[i]+4, precached_keys_len[i]-4, 0);
                 packdata_extend(pd, comment, strlen(comment), 0);
-                //packdata_del(pd2);
         }
         packdata_final(pd, SSH_AGENT_IDENTITIES_ANSWER);
         i = send(s, pd->buffer, pd->len, 0);
@@ -570,9 +644,8 @@ void answer_identities(int s) {
         int total;
         uint8_t buffer[8192]; // TODO: dynamic
         verbose_printf("[answer_identities] REQUESTING LIST OF KEYS\n");
-        write(serfd, "L", 1);
+        write_wrapper(serfd, "L", 1);
 
-        // was 535
         verbose_printf("[answer_identities] READING KEYS HEADER 4b\n");
         for (int i = 0; i<4; i++) {
                 read(serfd, &buffer[i], 1);
@@ -604,12 +677,185 @@ void answer_identities(int s) {
         packdata_del(pd);
 }
 
-void remove_newlines(char *data) {
-        char *pos;
-        if ((pos=strchr(data, '\r')) != NULL)
-                *pos = '\0';
-        if ((pos=strchr(data, '\n')) != NULL)
-                *pos = '\0';
+void critical_mbed_error(int errcode) {
+        char buf[1024];
+        mbedtls_strerror(errcode, buf, 1023);
+        printf("critical crypto error: %s\n", buf);
+        exit(1);
+}
+
+#define KEYBUF_SZ 2048
+#define IV_SZ 16
+#define KEYSRC_SZ 32 // Material for AES key generation, key salt maybe?
+
+void dongle_keywrite(char *keyfilename) {
+        char wrbuf[1];
+        mbedtls_pk_context pk;
+        mbedtls_rsa_context *rsa;
+        int ret, rnd_dev_fd;
+        char input_stdin[128];
+        char input_stdin_repeat[128];
+        uint32_t e_len, p_len, q_len, tocrypt_sz;
+        unsigned char keybuf[KEYBUF_SZ];
+        unsigned char crypted_keybuf[KEYBUF_SZ];
+        unsigned char key[32];
+        unsigned char iv[IV_SZ];
+        size_t offset = 0;
+
+        memset(keybuf, 0x0, KEYBUF_SZ);
+        memset(crypted_keybuf, 0x0, KEYBUF_SZ);
+
+        /* KEYSRC, IV and fill it with random data */
+        rnd_dev_fd = open("/dev/urandom", O_RDONLY);
+        if (rnd_dev_fd < 0) {
+                perror("rnd device open error - ");
+                exit(2);
+        }
+        read(rnd_dev_fd, keybuf, KEYBUF_SZ);
+        close(rnd_dev_fd);
+
+        offset += KEYSRC_SZ; // keysrc
+
+        memcpy(iv, &keybuf[offset], IV_SZ);
+        offset += IV_SZ;
+
+        stdin_disable_echo(0);
+        printf("Key decryption password (press enter if none):\r\n");
+        if (fgets (input_stdin, 127, stdin) == NULL)
+                exit(1);
+        stdin_reset();
+
+        remove_newlines(input_stdin);
+        verbose_printf("Opening key...\n");
+        mbedtls_pk_init(&pk);
+        ret = mbedtls_pk_parse_keyfile(&pk, keyfilename, input_stdin);
+        if (ret)
+                critical_mbed_error(ret);
+        if (!mbedtls_pk_can_do(&pk, MBEDTLS_PK_RSA)) {
+                printf("Invalid key type? We need RSA key!\n");
+                exit(1);
+        }
+        rsa = mbedtls_pk_rsa(pk);
+        e_len = mbedtls_mpi_size(&rsa->E);
+        p_len = mbedtls_mpi_size(&rsa->P);
+        q_len = mbedtls_mpi_size(&rsa->Q);
+        memcpy(&keybuf[offset], &e_len, 4);
+        offset += 4;
+        memcpy(&keybuf[offset], &p_len, 4);
+        offset += 4;
+        memcpy(&keybuf[offset], &q_len, 4);
+        offset += 4;
+        //printf("E %d P %d Q %d\n", e_len, p_len, q_len);
+        ret = mbedtls_mpi_write_binary(&rsa->E, &keybuf[offset], e_len);
+        if (ret)
+                critical_mbed_error(ret);
+        offset += e_len;
+        ret = mbedtls_mpi_write_binary(&rsa->P, &keybuf[offset], p_len);
+        if (ret)
+                critical_mbed_error(ret);
+        offset += p_len;
+        ret = mbedtls_mpi_write_binary(&rsa->Q, &keybuf[offset], q_len);
+        if (ret)
+                critical_mbed_error(ret);
+        offset += q_len;
+
+        memset(input_stdin, 0x0, 128);
+        memset(input_stdin_repeat, 0x0, 128);
+
+        do {
+                if (input_stdin[0] != 0x0) {
+                        printf("Try again\n");
+                        memset(input_stdin, 0x0, 128);
+                        memset(input_stdin_repeat, 0x0, 128);
+                }
+                stdin_disable_echo(0);
+                printf("Key encryption password for dongle (6+ characters):\r\n");
+                if (fgets (input_stdin, 127, stdin) == NULL)
+                        exit(1);
+                printf("Please repeat to ensure it is typed correctly:\r\n");
+                if (fgets (input_stdin_repeat, 127, stdin) == NULL)
+                        exit(1);
+                stdin_reset();
+                if (strlen(input_stdin) < 6 || strlen(input_stdin) >= 64) {
+                        printf("Too short! More than 6 characters and less than 64\n");
+                        continue;
+                }
+        } while (strncmp(input_stdin, input_stdin_repeat, 127));
+        remove_newlines(input_stdin);
+
+        /* AES Key generation Move as separate function, shared maybe ? */
+        {
+                unsigned char prekey[128];
+                memset(prekey, 0x0, 128);
+                memcpy(prekey, keybuf, KEYSRC_SZ);
+                memcpy(&prekey[32], input_stdin, strlen(input_stdin));
+                mbedtls_sha256(prekey, 128, key, 0);
+                memset(prekey, 0x0, 128);
+        }
+        uint32_t sum = 0;
+        for (int x=0; x<32; x++) {
+                sum += key[x];
+        }
+        printf("KeySum %02hhx\n", sum % 256);
+        for (int x=0; x<16; x++) {
+                sum += iv[x];
+        }
+        printf("Key+IVSum %02hhx\n", sum % 256);
+
+
+        // Rounding to 32 byte
+        tocrypt_sz = offset-KEYSRC_SZ-IV_SZ;
+
+        if (tocrypt_sz % 32 != 0) {
+                verbose_printf("Rounding to 32, before %d ", tocrypt_sz);
+                offset += 32 - (tocrypt_sz % 32); // update it too as it represents total size
+                tocrypt_sz = (tocrypt_sz + 32 - (tocrypt_sz % 32));
+                verbose_printf("now %d\n", tocrypt_sz);
+        }
+
+        /* Copy unencrypted header, salt for aes key and IV */
+        memcpy(crypted_keybuf, keybuf, KEYSRC_SZ+IV_SZ);
+
+        {
+                mbedtls_aes_context aes;
+                mbedtls_aes_init(&aes);
+                mbedtls_aes_setkey_enc(&aes, key, 256);
+                mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, offset-KEYSRC_SZ-IV_SZ, iv, &keybuf[KEYSRC_SZ+IV_SZ], &crypted_keybuf[KEYSRC_SZ+IV_SZ]);
+                mbedtls_aes_free(&aes);
+                // copy back crypted content
+                memcpy(&keybuf[KEYSRC_SZ+IV_SZ], &crypted_keybuf[KEYSRC_SZ+IV_SZ], offset-KEYSRC_SZ-IV_SZ);
+        }
+
+        verbose_printf("All done, total size %d\n", offset);
+
+        write_wrapper(serfd, "W", 1);
+        verbose_printf("[writing_key] Write command issued\n");
+
+        uint32_t offset_norder = htonl(offset);
+        write_wrapper(serfd, &offset_norder, 4);
+        verbose_printf("[writing_key] Data length %d sent\n", offset);
+        readexactly(serfd, 1, wrbuf); // read Y
+        verbose_printf("[writing_key] Return code %c\n", wrbuf[0]);
+        readexactly(serfd, 1, wrbuf); // read Y
+        verbose_printf("[writing_key] Return code %c\n", wrbuf[0]);
+        readexactly(serfd, 1, wrbuf); // read Y
+        verbose_printf("[writing_key] Return code %c\n", wrbuf[0]);
+        readexactly(serfd, 1, wrbuf); // read Y
+        verbose_printf("[writing_key] Return code %c\n", wrbuf[0]);
+
+
+        printf("KeySRC0 %02hhx\n", keybuf[0]);
+        printf("KeyIV %02hhx\n", keybuf[KEYSRC_SZ]);
+        for (int i=0; i<offset; i++) {
+                write_wrapper(serfd, &keybuf[i], 1);
+                readexactly(serfd, 1, wrbuf); // read Y
+                verbose_printf("[writing_key] Written %d byte[%02hhx], return code %c\n", i, keybuf[i], wrbuf[0]);
+        }
+
+        verbose_printf("[writing_key] Key is written\n");
+        readexactly(serfd, 1, wrbuf);
+        verbose_printf("[writing_key] Return code %c\n", wrbuf[0]);
+        exit(0);
 }
 
 void config_dongle (void) {
@@ -652,17 +898,17 @@ void config_dongle (void) {
         if (fgets (input_stdin, 127, stdin) == NULL)
                 exit(1);
         if (input_stdin[0] == 'y') {
-          cfg |= CFG_BIT_BLINKERLOCK;
+                cfg |= CFG_BIT_BLINKERLOCK;
         }
 
         memcpy(cfgbuffer, &cfg, 4);
 
         /* Write 0x1 to start flashing process */
         input_stdin[0] = 0x1;
-        write(serfd, input_stdin, 1);
+        write_wrapper(serfd, input_stdin, 1);
 
         for (int i=0; i<1024; i++) {
-                write(serfd, &cfgbuffer[i], 1); /* Single byte writes - safest */
+                write_wrapper(serfd, &cfgbuffer[i], 1); /* Single byte writes - safest */
         }
         printf("All done! Enjoy!\n");
         exit(0);
@@ -678,6 +924,7 @@ void show_help(char **argv) {
         printf("  -D \t\t debug, do not daemonize\n");
         printf("  -d \t\t Ask password only once at start, it will be in stick ram until lockout and removed from host memory (disables reopen)\n");
         printf("  -b path\t\t Path and name to 'ask pass' program (might work: ssh-askpass), will ask pass on each auth if blinker feature enabled\n");
+        printf("  -a path\t\t Ask password over 'ask pass' program for keys on start (stored in RAM until key removed from power)\n");
         printf("More information at: https://github.com/nuclearcat/cedarkey\n");
         exit(0);
 }
@@ -708,7 +955,7 @@ int main(int argc, char **argv)
                 precached_keys_len[i] = 0;
         }
 
-        while ((c = getopt (argc, argv, "hns:p:Dw:k:b:v")) != -1) {
+        while ((c = getopt (argc, argv, "hns:p:Dw:k:b:a:v")) != -1) {
                 switch (c)
                 {
                 case 'h':
@@ -739,7 +986,10 @@ int main(int argc, char **argv)
                         pincode = strdup(optarg);
                         break;
                 case 'b':
-                        askpass = strdup(optarg);
+                        blinky_askpass = strdup(optarg);
+                        break;
+                case 'a':
+                        startup_askpass = strdup(optarg);
                         break;
                 case 'k':
                         keynum = atoi(optarg);
@@ -748,23 +998,28 @@ int main(int argc, char **argv)
                         exit(1);
                 }
         }
+        if (argc == 1) {
+                show_help(argv);
+                exit(0);
+        }
 
         if (portname == NULL) {
-                printf("Please specify device name for CedarKey\n");
+                printf("Please specify device name for CedarKey, for example /dev/ttyACM0\n");
                 exit(1);
         }
+
+        stdin_disable_echo(1); // just save stdin tcattr
 
         if (flag_cfgnew) {
                 char buf[32];
                 printf("Please make sure blue led is ON. If not, unplug dongle, and plug it back\n");
-                printf("After that, press enter:");
+                printf("After that, press <Enter>");
                 if (fgets (buf, 2, stdin) == NULL)
                         exit(1);
                 serfd = open_port(portname, NULL, 0);
                 if (serfd < 0) {
-                  printf("Can't open device, exiting. \n");
-                  printf("TIP: After plugging you need to wait a little, till modemmanager give up messing up with device\n");
-                  exit(0);
+                        printf("Can't open device, exiting.\n");
+                        exit(0);
                 }
                 config_dongle();
                 exit(0);
@@ -772,16 +1027,21 @@ int main(int argc, char **argv)
 
         serfd = open_port(portname, pincode, 1);
         if (serfd < 0) {
-          printf("Initial port opening failed, exiting\n");
-          exit(1);
+                printf("Initial port opening failed, exiting\n");
+                exit(1);
         }
+
+        if (startup_askpass) {
+                faskpass_startup();
+        }
+
         if (keynum == -1 && !keyfilename) {
                 precache_keys();
         } else {
                 char switchkey[] = "X0";
                 if (keynum > 0 && keynum < 30)
-                  switchkey[1] = '0' + keynum;
-                write(serfd, switchkey, 2);
+                        switchkey[1] = '0' + keynum;
+                write_wrapper(serfd, switchkey, 2);
                 readexactly(serfd, 1, switchkey);
                 verbose_printf("Switched\n");
         }
@@ -790,9 +1050,9 @@ int main(int argc, char **argv)
            Problem: reconnecting dongle wont work
          */
         if (password) {
-                write(serfd, "P", 1);
-                write(serfd, password, strlen(password));
-                write(serfd, "~", 1);
+                write_wrapper(serfd, "P", 1);
+                write_wrapper(serfd, password, strlen(password));
+                write_wrapper(serfd, "~", 1);
                 memset(password, 0x0, strlen(password));
                 free(password);
                 password = NULL;
@@ -803,30 +1063,11 @@ int main(int argc, char **argv)
         rand_str(rndpart, 8);
 
         if (keyfilename) {
-                int keyfd;
-                char wrbuf[1];
                 if (keynum != -1) {
-                  printf("Free key will be selected automatically, you should not specify it\n");
-                  exit(0);
+                        printf("Free key will be selected automatically, you should not specify it\n");
+                        exit(0);
                 }
-                keyfd = open(keyfilename, O_RDONLY);
-                if (keyfd < 0) {
-                        perror("key open error - ");
-                        exit(2);
-                }
-                verbose_printf("[writing_key] Key file opened\n");
-                write(serfd, "W", 1);
-                verbose_printf("[writing_key] Write command issued\n");
-                while (read(keyfd, wrbuf, 1)  == 1) {
-                        verbose_printf("[writing_key] Write 1 byte of key\n");
-                        write(serfd, wrbuf, 1);
-                }
-                verbose_printf("[writing_key] Final byte\n");
-                write(serfd, "_", 1);
-                close(keyfd);
-                printf("Done, key is written\n");
-                readexactly(serfd, 1, wrbuf); // read Y
-                exit(1);
+                dongle_keywrite(keyfilename);
         }
 
         /* For safety it is better to say within home directory */
@@ -876,7 +1117,7 @@ int main(int argc, char **argv)
                         else {
                                 char switchkey[] = "X0";
                                 switchkey[1] = '0' + keynum;
-                                write(serfd, switchkey, 2);
+                                write_wrapper(serfd, switchkey, 2);
                                 readexactly(serfd, 1, switchkey);
                         }
                 }

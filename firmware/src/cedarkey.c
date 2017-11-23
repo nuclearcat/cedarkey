@@ -48,13 +48,10 @@
 #include <libopencm3/cm3/systick.h>
 #include <libopencm3/usb/usbd.h>
 #include <libopencm3/usb/cdc.h>
+#include "mbedtls/aes.h"
 #include "mbedtls/rsa.h"
-#include "mbedtls/x509_crt.h"
-#include "mbedtls/error.h"
+#include "mbedtls/sha256.h"
 #include "mbedtls/sha512.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/pk.h"
 #include "common.h"
 volatile uint32_t ticktock;
 
@@ -76,8 +73,8 @@ volatile uint32_t ticktock;
 
 /* We need to read/write protect 28 pages, 0-27 */
 #define FLASH_ADDRESS             0x08000000
-#define KEYS_OFFSET               (56*1024)
-#define CFG_OFFSET                (55*1024)
+#define KEYS_OFFSET               (67*1024)
+#define CFG_OFFSET                (66*1024)
 #define CFG_SALT_OFFSET           4
 #define CFG_USERPIN_HASH_OFFSET   68
 #define CFG_ADMINPIN_HASH_OFFSET  132
@@ -94,6 +91,7 @@ volatile uint32_t ticktock;
 #define STATE_PRESIGN3        7
 #define STATE_KEYSELECT       8
 #define STATE_GETPASS         9
+#define STATE_TERMTEST        251
 #define STATE_BLOCKED         252
 #define STATE_EMPTY           253
 #define STATE_CONFIGWRITE     254
@@ -107,12 +105,12 @@ uint32_t stick_state = STATE_DEFAULT;
 uint32_t bytes_written = 0;
 char *bigbuf = NULL;
 char tmplenbuf[4];
-unsigned char *password;
-uint32_t current_key_index = 0;
+unsigned char password[65];
+uint32_t current_key_index = -1;
 usbd_device *usbd_dev;
 uint32_t signature_type = 0;
 
-//static void pgm_prewrite_key (uint32_t);
+
 static void pgm_write_key (char *data, uint32_t len);
 static void pgm_config(char *);
 #ifdef ALLOW_READING_KEY
@@ -258,30 +256,32 @@ static const char *usb_strings[] = {
 /* Buffer to be used for control requests. */
 uint8_t usbd_control_buffer[128];
 
+static void __attribute__ ((noinline)) usb_send_char(char byte) {
+    while (usbd_ep_write_packet(usbd_dev, 0x82, &byte, 1) == 0) ;
+}
+
 static void send_ok (void) {
-        char buf[] = "Y";
-        while (usbd_ep_write_packet(usbd_dev, 0x82, buf, 1) == 0) ;
+  usb_send_char('Y');
 }
 
 static void send_error (void) {
-        char buf[] = "E";
-        while (usbd_ep_write_packet(usbd_dev, 0x82, buf, 1) == 0) ;
+  usb_send_char('N');
 }
 
 /* Pseudorandom */
 static int blinker_random (void) {
-  unsigned char tmpbuf[128];
-  unsigned char hash[32];
-  uint32_t ticktock_now = ticktock;
-  uint32_t start_address = FLASH_ADDRESS + CFG_OFFSET;
-  unsigned char* salt_ptr= (unsigned char*)start_address+CFG_SALT_OFFSET;
-  memcpy(tmpbuf, salt_ptr, 64);
-  memcpy(&tmpbuf[64], &ticktock_now, 4);
-  mbedtls_sha256((unsigned char*)tmpbuf, 128, hash, 0);
-  if ((hash[0] % 6) == 0)
-    return(6);
-  else
-    return(hash[0] % 6);
+        unsigned char tmpbuf[128];
+        unsigned char hash[32];
+        uint32_t ticktock_now = ticktock;
+        uint32_t start_address = FLASH_ADDRESS + CFG_OFFSET;
+        unsigned char* salt_ptr= (unsigned char*)start_address+CFG_SALT_OFFSET;
+        memcpy(tmpbuf, salt_ptr, 64);
+        memcpy(&tmpbuf[64], &ticktock_now, 4);
+        mbedtls_sha256((unsigned char*)tmpbuf, 128, hash, 0);
+        if ((hash[0] % 6) == 0)
+                return(6);
+        else
+                return(hash[0] % 6);
 }
 
 static int cdcacm_control_request(usbd_device *usbd_dev_local, struct usb_setup_data *req, uint8_t **buf,
@@ -392,16 +392,102 @@ static int verify_pin(unsigned char *data, uint32_t len) {
         return(memcmp(output, verification_saltedhash_ptr, 64));
 }
 
-// mbedtls_pk_get_type
+#define KEYBUF_SZ 2048
+#define IV_SZ 16
+#define KEYSRC_SZ 32
+
+static int parse_key(mbedtls_rsa_context *ctx, uint32_t index) {
+        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + findkeyoffset(index);
+        unsigned char* crypted_keybuf = (unsigned char*)start_address;
+        uint32_t keylen = findkeylen(index);
+        uint32_t offset = 0;
+        unsigned char keybuf[KEYBUF_SZ];
+        unsigned char key[32];
+        unsigned char iv[IV_SZ];
+        uint32_t e_len, p_len, q_len;
+        int ret;
+        mbedtls_mpi P1, Q1, H;
+
+        if (keylen == 0 || keylen == UINT32_MAX)
+                return(1);
+
+        memset(keybuf, 0x0, KEYBUF_SZ);
+        memset(key, 0x0, sizeof(key));
+
+        // Generating probably correct AES key
+        {
+                unsigned char prekey[128];
+                memset(prekey, 0x0, 128);
+                memcpy(prekey, crypted_keybuf, KEYSRC_SZ);
+                memcpy(&prekey[32], password, strlen((char*)password));
+                mbedtls_sha256(prekey, 128, key, 0);
+                memset(prekey, 0x0, 128);
+        }
+        memcpy(&iv, &crypted_keybuf[KEYSRC_SZ], IV_SZ);
+
+        {
+                mbedtls_aes_context aes;
+                mbedtls_aes_init(&aes);
+                mbedtls_aes_setkey_dec(&aes, key, 256);
+                if (mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, keylen-KEYSRC_SZ-IV_SZ, iv, &crypted_keybuf[KEYSRC_SZ+IV_SZ], &keybuf[KEYSRC_SZ+IV_SZ]))
+                        return(9);
+                mbedtls_aes_free(&aes);
+        }
+
+        offset = IV_SZ + KEYSRC_SZ;
+        memcpy(&e_len, &keybuf[offset], 4);
+        offset += 4;
+        memcpy(&p_len, &keybuf[offset], 4);
+        offset += 4;
+        memcpy(&q_len, &keybuf[offset], 4);
+        offset += 4;
+        if (e_len > 8 || p_len > 512 || q_len > 512) {
+                return(2);
+        }
+
+        if (e_len == 0 || p_len == 0 || q_len == 0) {
+                return(3);
+        }
+
+        ret = mbedtls_mpi_read_binary(&ctx->E, &keybuf[offset], e_len);
+        if (ret)
+                return(4);
+        offset += e_len;
+        ret = mbedtls_mpi_read_binary(&ctx->P, &keybuf[offset], p_len);
+        if (ret)
+                return(5);
+        offset += p_len;
+        ret = mbedtls_mpi_read_binary(&ctx->Q, &keybuf[offset], q_len);
+        if (ret)
+                return(6);
+        offset += q_len; //useless
+        ctx->len = 0;
+        mbedtls_mpi_init( &P1 );
+        mbedtls_mpi_init( &Q1 );
+        mbedtls_mpi_init( &H );
+        MBEDTLS_MPI_CHK( mbedtls_mpi_mul_mpi( &ctx->N, &ctx->P, &ctx->Q ) );
+        MBEDTLS_MPI_CHK( mbedtls_mpi_sub_int( &P1, &ctx->P, 1 ) );
+        MBEDTLS_MPI_CHK( mbedtls_mpi_sub_int( &Q1, &ctx->Q, 1 ) );
+        MBEDTLS_MPI_CHK( mbedtls_mpi_mul_mpi( &H, &P1, &Q1 ) );
+        MBEDTLS_MPI_CHK( mbedtls_mpi_inv_mod( &ctx->D, &ctx->E, &H  ) );
+        MBEDTLS_MPI_CHK( mbedtls_mpi_mod_mpi( &ctx->DP, &ctx->D, &P1 ) );
+        MBEDTLS_MPI_CHK( mbedtls_mpi_mod_mpi( &ctx->DQ, &ctx->D, &Q1 ) );
+        MBEDTLS_MPI_CHK( mbedtls_mpi_inv_mod( &ctx->QP, &ctx->Q, &ctx->P ) );
+        ctx->len = mbedtls_mpi_size( &ctx->N );
+cleanup:
+        mbedtls_mpi_free( &P1 );
+        mbedtls_mpi_free( &Q1 );
+        mbedtls_mpi_free( &H );
+        if (!ctx->len)
+                return(7);
+        return(0);
+}
 
 static void sign_data_rsa (uint32_t index) {
         unsigned char hash[64];
-        mbedtls_pk_context pk;
+        mbedtls_rsa_context rsa;
         int n = 0;
         size_t outn;
-        //uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + (index*4096);
-        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + findkeyoffset(index);
-        unsigned char* memory_ptr= (unsigned char*)start_address;
 
         if (signature_type == 0)
                 mbedtls_sha512((unsigned char*)bigbuf, bytes_written, hash, 0);
@@ -412,15 +498,8 @@ static void sign_data_rsa (uint32_t index) {
          */
         free(bigbuf);
         bigbuf = NULL;
-        mbedtls_pk_init(&pk);
-        {
-                uint32_t i = findkeylen(index);
-                if (!start_address || i == UINT_MAX) {
-                        mbedtls_pk_free(&pk);
-                        return;
-                }
-                n = mbedtls_pk_parse_key(&pk, memory_ptr, i, password, strlen((char*)password));
-        }
+        mbedtls_rsa_init(&rsa, MBEDTLS_RSA_PKCS_V15, 0);
+        n = parse_key(&rsa, index);
         if (!n) {
                 char out[560]; /* TODO: put more precise value. Memory is scarce */
 #ifdef TIMING_PROTECTION
@@ -428,100 +507,106 @@ static void sign_data_rsa (uint32_t index) {
                 // TODO: Add handling of counter rollover. Do we really expect stick to stay 49 days?
 #endif
                 if (signature_type == 0)
-                        mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA512, hash, 0, (unsigned char*)out, &outn, NULL, NULL);
+                        n = mbedtls_rsa_pkcs1_sign(&rsa, NULL, NULL, MBEDTLS_RSA_PRIVATE, MBEDTLS_MD_SHA512, 0, hash, (unsigned char*)out);
                 else
-                        mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256, hash, 0, (unsigned char*)out, &outn, NULL, NULL);
+                        n = mbedtls_rsa_pkcs1_sign(&rsa, NULL, NULL, MBEDTLS_RSA_PRIVATE, MBEDTLS_MD_SHA256, 0, hash, (unsigned char*)out);
 #ifdef TIMING_PROTECTION
                 while (ticktock < starttock + 15000) ;
 #endif
-                usb_write_packedlen(outn);
-                for (size_t i=0; i<outn; i++) {
-                        while(usbd_ep_write_packet(usbd_dev, 0x82, &out[i], 1) == 0) ;
+                /*
+                {
+                        char xout[64];
+                        sprintf(xout, "%d\n", rsa.len);
+                        for(int i=0; i<strlen(xout); i++)
+                                while(usbd_ep_write_packet(usbd_dev, 0x82, &xout[i], 1) == 0) ;
                 }
+                */
+                if (!n) {
+                        outn = rsa.len;
+                        usb_write_packedlen(outn);
+                        for (size_t i=0; i<outn; i++) {
+                                usb_send_char(out[i]);
+                        }
+                } else {
+                        usb_write_packedlen(0);
+                }
+        } else {
+                usb_write_packedlen(0);
         }
-        mbedtls_pk_free(&pk);
+        mbedtls_rsa_free(&rsa);
 }
 
 
 #ifdef TEST_SEQUENCE
 static void test_key (uint32_t index) {
-        mbedtls_rsa_context *rsa;
-        mbedtls_pk_context pk;
+        mbedtls_rsa_context rsa;
         int n;
         char rndbuf[32];
         unsigned char hash[64];
         unsigned char out[512];
-        size_t outn;
-        //uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + (index*4096);
-        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + findkeyoffset(index);
-        unsigned char* memory_ptr= (unsigned char*)start_address;
         uint32_t i = findkeylen(index);
 
         if (i == 0)
                 send_error();
-        while(usbd_ep_write_packet(usbd_dev, 0x82, "0", 1) == 0) ;
-        if (i == UINT32_MAX)
+        usb_send_char('B');
+        if (i == UINT32_MAX) {
                 send_error();
-        while(usbd_ep_write_packet(usbd_dev, 0x82, "1", 1) == 0) ;
-        mbedtls_pk_init(&pk);
-        while(usbd_ep_write_packet(usbd_dev, 0x82, "2", 1) == 0) ;
-        n = mbedtls_pk_parse_key(&pk, memory_ptr, i, password, strlen((char*)password));
-        while(usbd_ep_write_packet(usbd_dev, 0x82, "3", 1) == 0) ;
-        if (!n) {
-                while(usbd_ep_write_packet(usbd_dev, 0x82, "U", 1) == 0) ;
-                rsa = mbedtls_pk_rsa(pk);
-                if (mbedtls_rsa_check_pubkey(rsa))
-                        gpio_clear(GPIOC, GPIO13);
-                if (mbedtls_rsa_check_privkey(rsa))
-                        gpio_clear(GPIOC, GPIO13);
-        } else {
-                while(usbd_ep_write_packet(usbd_dev, 0x82, "E", 1) == 0) ;
+                return;
         }
-        mbedtls_sha512((unsigned char*)rndbuf, 32, hash, 0);
-        while(usbd_ep_write_packet(usbd_dev, 0x82, "H", 1) == 0) ;
-        n = mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA512, hash, 0, (unsigned char*)out, &outn, NULL, NULL);
+        usb_send_char('0' + strlen((char*)password));
+
+
+        usb_send_char('1');
+
+        mbedtls_rsa_init(&rsa, MBEDTLS_RSA_PKCS_V15, 0);
+        n = parse_key(&rsa, index);
+        usb_send_char('2');
+
         if (!n) {
-                while(usbd_ep_write_packet(usbd_dev, 0x82, "S", 1) == 0) ;
+                usb_send_char('U');
+                if (mbedtls_rsa_check_pubkey(&rsa))
+                        usb_send_char('Z');
+                if (mbedtls_rsa_check_privkey(&rsa))
+                        usb_send_char('X');
+                mbedtls_sha512((unsigned char*)rndbuf, 32, hash, 0);
+                usb_send_char('H');
+                n = mbedtls_rsa_pkcs1_sign(&rsa, NULL, NULL, MBEDTLS_RSA_PRIVATE, MBEDTLS_MD_SHA512, 0, hash, (unsigned char*)out);
+                if (!n) {
+                        usb_send_char('S');
+                } else {
+                        usb_send_char('E');
+                }
         } else {
-                while(usbd_ep_write_packet(usbd_dev, 0x82, "E", 1) == 0) ;
+                usb_send_char('E');
         }
-        mbedtls_pk_free(&pk);
+        mbedtls_rsa_free(&rsa);
         walktofreekey();
         if (current_key_index > 30) {
-                while(usbd_ep_write_packet(usbd_dev, 0x82, "E", 1) == 0) ;
+                usb_send_char('E');
         } else {
-                char rs[] = "0";
-                rs[0]+=current_key_index;
-                while(usbd_ep_write_packet(usbd_dev, 0x82, rs, 1) == 0) ;
+                usb_send_char('0' + current_key_index);
         }
+
+
 }
 #endif
 
 static int list_key (uint32_t index) {
-        mbedtls_rsa_context *rsa;
-        mbedtls_pk_context pk;
+        mbedtls_rsa_context rsa;
         int n;
-        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + findkeyoffset(index);
-        unsigned char* memory_ptr= (unsigned char*)start_address;
-        uint32_t i = findkeylen(index);
+        uint32_t i;
 
-        if (i == UINT_MAX) {
-          usb_write_packedlen(0);
-          return(0);
-        }
-
-        mbedtls_pk_init(&pk);
-        n = mbedtls_pk_parse_key(&pk, memory_ptr, i, password, strlen((char*)password));
+        mbedtls_rsa_init(&rsa, MBEDTLS_RSA_PKCS_V15, 0);
+        n = parse_key(&rsa, index);
         if (!n) {
                 unsigned char buf[513];
                 /* TODO: calculate total length depends on modulus length */
-                rsa = mbedtls_pk_rsa(pk);
 
                 #define EXP_LEN           3 // Exponent len
                 #define RSA_HEADER_LEN    7 // RSA header
 
                 // Whole packet size
-                usb_write_packedlen((4 + rsa->N.n*4 + 1) + (4 + RSA_HEADER_LEN) + (4 + EXP_LEN));
+                usb_write_packedlen((4 + rsa.N.n*4 + 1) + (4 + RSA_HEADER_LEN) + (4 + EXP_LEN));
 
                 /* Why it's here? Because one day we might have other protocols */
                 usb_write_packedlen(RSA_HEADER_LEN);
@@ -529,29 +614,28 @@ static int list_key (uint32_t index) {
 
                 /* Exponent part */
                 usb_write_packedlen(EXP_LEN);
-                mbedtls_mpi_write_binary(&rsa->E, buf, EXP_LEN);
+                mbedtls_mpi_write_binary(&rsa.E, buf, EXP_LEN);
                 for (i=0; i<EXP_LEN; i++) {
-                        while(usbd_ep_write_packet(usbd_dev, 0x82, &buf[i], 1) == 0) ;
+                        usb_send_char(buf[i]);
                 }
 
                 /* Modulus part */
-                usb_write_packedlen(rsa->N.n*4 + 1);
+                usb_write_packedlen(rsa.N.n*4 + 1);
 
                 /* Black magic of RSA? 00 prefix - means positive number */
-                buf[0] = 0x0;
-                while(usbd_ep_write_packet(usbd_dev, 0x82, buf, 1) == 0) ;
+                usb_send_char(0x0);
 
-                if (mbedtls_mpi_write_binary(&rsa->N, buf, rsa->N.n*4)) {
+                if (mbedtls_mpi_write_binary(&rsa.N, buf, rsa.N.n*4)) {
                         send_error();
                 }
 
-                for (size_t x=0; x<(rsa->N.n*4); x++) {
-                        while(usbd_ep_write_packet(usbd_dev, 0x82, &buf[x], 1) == 0) ;
+                for (size_t x=0; x<(rsa.N.n*4); x++) {
+                        usb_send_char(buf[x]);
                 }
         } else {
                 usb_write_packedlen(0); // This means nothing to send / error unpacking key
         }
-        mbedtls_pk_free(&pk);
+        mbedtls_rsa_free(&rsa);
         return(n);
 }
 
@@ -566,15 +650,19 @@ static int list_key (uint32_t index) {
                 heap_end = &end;
         }
         char x[64];
-
         prev_heap_end = heap_end;
         heap_end += incr;
+        if (current_key_index == -1)
+          return (void *) prev_heap_end;
+
+
         sprintf(x, "grow %d 0x%X-0x%X(%d)\r\n",
                 incr,
                 (uint32_t)(&end),
                 (uint32_t)(heap_end),
                 (uint32_t)(heap_end) - (uint32_t)(&end));
-        usbd_ep_write_packet(usbd_dev, 0x82, x, strlen(x));
+        while(usbd_ep_write_packet(usbd_dev, 0x82, x, strlen(x)) == 0) ;
+
         return (void *) prev_heap_end;
    }
  */
@@ -587,8 +675,7 @@ static void feed_rx_data(char byte) {
                         // TODO: make it secure! timing attack!
                         if (strlen((char*)password) > 0 && !verify_pin(password, strlen((char*)password))) {
                                 stick_state = STATE_DEFAULT;
-                                free(password);
-                                password = NULL;
+                                memset(password, 0x0, 64);
                                 bytes_written = 1; /* THIS IS SPECIAL STATE INDICATING KEY IS JUST UNLOCKED! */
                         } else {
                                 memset(password, 0x0, 65);
@@ -601,12 +688,12 @@ static void feed_rx_data(char byte) {
                 }
                 break;
         case STATE_GETPASS:
-                bytes_written++;
                 if (byte == 0x0 || byte == '~' || bytes_written == 64) {
                         // If we set password 0 length - free it
                         if (!bytes_written) {
-                                free(password);
-                                password = NULL;
+                                memset(password, 0x0, 64);
+                        } else {
+                                password[bytes_written] = 0x0; // terminating zero
                         }
                         stick_state = STATE_DEFAULT;
                         bytes_written = 0;
@@ -620,7 +707,7 @@ static void feed_rx_data(char byte) {
                 int idx = byte - '0';
                 if (idx >= 0 && idx < 30) {
                         current_key_index = idx;
-                        usbd_ep_write_packet(usbd_dev, 0x82, &byte, 1);
+                        usb_send_char(byte);
                 }
         }
                 stick_state = STATE_DEFAULT;
@@ -653,9 +740,8 @@ static void feed_rx_data(char byte) {
                 if (bytes_written == 1024) {
                         /* TODO: hash salt with current ticktock+ADC? to make it more secret
                            in case it was intercepted on initial configuration
-                        */
+                         */
                         stick_state = STATE_DEFAULT;
-                        password = malloc(65);
                         memset(password, 0x0, 65);
                         pgm_config(bigbuf);
                         bytes_written = 0;
@@ -665,41 +751,49 @@ static void feed_rx_data(char byte) {
                 break;
         /* Write key to flash TODO: verify it with parse after writing? */
         case STATE_WRITE:
-                // We signal end of key by _ symbol or 0, maybe better some other way?
-                if (bytes_written == 4095 || byte == 0x0 || byte == '_') {
-                        /* We dont have space anymore */
-                        byte = 0x0; /* Final byte should be 0 */
-                        bigbuf[bytes_written] = byte;
-                        stick_state = STATE_DEFAULT;
-                        bytes_written++;
-                        // Round bytes
-                        if (bytes_written % 4 != 0) {
-                                uint32_t bytes = ((bytes_written / 4) * 4) + 4;
-                                bytes_written = bytes;
+        {
+                uint32_t keysize = 0;
+                if (bytes_written >= 4) {
+                        memcpy(&keysize, bigbuf, 4);
+                        keysize = __builtin_bswap32(keysize);
+                        /* TODO: fix what is lowest size? */
+
+                        // if key size we got is wrong
+                        if (keysize > 2048 || keysize < 64) {
+                                // wrong size
+                                stick_state = STATE_DEFAULT;
+                                memset(bigbuf, 0x0, 4096);
+                                free(bigbuf);
+                                send_error();
+                                break;
                         }
 
-                        pgm_write_key(bigbuf, bytes_written);
-                        memset(bigbuf, 0x0, 4096);
-                        free(bigbuf);
-                        /* Final byte and write is done! */
-                        usbd_ep_write_packet(usbd_dev, 0x82, "#", 1);
-                } else {
-                        bigbuf[bytes_written] = byte;
-                        bytes_written++;
-                        /* Show that we received byte and its not final */
-                        usbd_ep_write_packet(usbd_dev, 0x82, "#", 1);
+                        // if we got all data
+                        if (bytes_written+1 == keysize + 4) {
+                                pgm_write_key(&bigbuf[4], keysize);
+                                stick_state = STATE_DEFAULT;
+                                memset(bigbuf, 0x0, 4096);
+                                free(bigbuf);
+                                send_ok();
+                                break;
+                        }
                 }
+        }
+                bigbuf[bytes_written] = byte;
+                bytes_written++;
+                /* Show that we received byte and its not final */
+                usb_send_char('#');
                 break;
         /* Blink specific number of times with small pause access code */
         case STATE_PRESIGNBLOCKED:
         {
-          if (byte - '0' != (uint8_t)bytes_written) {
-            stick_state = STATE_BLOCKED;
-          } else {
-            stick_state = STATE_PRESIGN;
-            gpio_clear(GPIOC, GPIO13); // it will be toggled during sign
-            bytes_written = 0;
-          }
+                if (byte - '0' != (uint8_t)bytes_written) {
+                        stick_state = STATE_BLOCKED;
+                } else {
+                        stick_state = STATE_PRESIGN;
+                        gpio_clear(GPIOC, GPIO13); // it will be toggled during sign
+                        bytes_written = 0;
+                }
         }
         break;
         case STATE_PRESIGN3:
@@ -713,9 +807,11 @@ static void feed_rx_data(char byte) {
                 bytes_written++;
                 /* Is it last byte? sign and output result*/
                 if (bytes_written == expected_data) {
-                        gpio_toggle(GPIOC, GPIO13); // TODO: optional, change LED state to show we are in process of signing, mb make it blink?
-                        if (signature_type == 0 || signature_type == 1)
+                        if (signature_type == 0 || signature_type == 1) {
+                                gpio_toggle(GPIOC, GPIO13); // TODO: optional, change LED state to show we are in process of signing, mb make it blink?
                                 sign_data_rsa(current_key_index);
+                        }
+
                         bytes_written = 0;
                         stick_state = STATE_DEFAULT;
                 }
@@ -771,12 +867,16 @@ static void feed_rx_data(char byte) {
                                 break;
                         bytes_written = 0;
                         walktofreekey();
-                        //pgm_prewrite_key(current_key_index);
-                        stick_state = STATE_WRITE;
+
                         /* TODO such fat buffer maybe not necessary,
                            we can rewrite by writing 4 byte chunks */
                         bigbuf = malloc(4096);
-                        memset(bigbuf, 0x0, 4096);
+                        if (!bigbuf) {
+                                send_error();
+                        } else {
+                                memset(bigbuf, 0x0, 4096);
+                                stick_state = STATE_WRITE;
+                        }
                         break;
                 /* Select key index */
                 case 'X':
@@ -784,35 +884,29 @@ static void feed_rx_data(char byte) {
                         break;
                 /* Request signing (TODO: SHA256 option) */
                 case 'S':
-                        {
-                          uint32_t cfg;
-                          cfg_read(&cfg, 4, 0);
-                          if (cfg & CFG_BIT_BLINKERLOCK) {
-                            stick_state = STATE_PRESIGNBLOCKED;
-                            bytes_written = blinker_random();
-                          } else {
-                            stick_state = STATE_PRESIGN;
-                            bytes_written = 0;
-                          }
+                {
+                        uint32_t cfg;
+                        cfg_read(&cfg, 4, 0);
+                        if (cfg & CFG_BIT_BLINKERLOCK) {
+                                stick_state = STATE_PRESIGNBLOCKED;
+                                bytes_written = blinker_random();
+                        } else {
+                                stick_state = STATE_PRESIGN;
+                                bytes_written = 0;
                         }
-                        break;
+                }
+                break;
                 /* Set password for unlocking keys */
                 case 'P':
                         bytes_written = 0;
                         stick_state = STATE_GETPASS;
-                        if (!password) {
-                                password = malloc(65);
-                                memset(password, 0x0, 65);
-                        }
+                        memset(password, 0x0, 64);
                         break;
                 /* Lock dongle */
                 case 'Z':
                         bytes_written = 0;
-                        if (password)
-                                free(password);
                         stick_state = STATE_UNLOCKING;
-                        password = malloc(65);
-                        memset(password, 0x0, 65);
+                        memset(password, 0x0, 64);
                         break;
                 /* Return public part of current key */
                 case 'L':
@@ -835,6 +929,11 @@ static void feed_rx_data(char byte) {
                 case 'T':
                         test_key(current_key_index);
                         break;
+
+                case '1':
+                        stick_state = STATE_TERMTEST;
+                        break;
+
 #endif
                 }
         }
@@ -905,27 +1004,6 @@ static void pgm_config(char *data) {
         flash_lock();
 }
 
-/*
-  Leave for future, when we gain capability of rewriting/erasing keys
- */
- /*
-static void pgm_prewrite_key (uint32_t index) {
-        uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET +findkeyoffset(index);
-        uint32_t i;
-        // TODO: Change this. 16 for "invisible" 64kb flash
-        if (index > 9) {
-                stick_state = STATE_DEFAULT;
-                send_error();
-                return;
-        }
-        flash_unlock();
-        for (i=start_address; i<start_address+4096; i+=1024) {
-                flash_erase_page(i);
-                flash_wait_for_last_operation();
-        }
-}
-*/
-
 // Should be divisible by 4 byte!
 static void pgm_write_key (char *data, uint32_t len) {
         uint32_t start_address = FLASH_ADDRESS + KEYS_OFFSET + findkeyoffset(current_key_index);
@@ -946,7 +1024,6 @@ int main(void) {
         uint32_t i;
         uint32_t lastmsgtock = 0;
 
-        //rcc_clock_setup_in_hsi_out_48mhz();
         rcc_clock_setup_in_hse_8mhz_out_72mhz();
 
         rcc_periph_clock_enable(RCC_GPIOC);
@@ -984,8 +1061,8 @@ int main(void) {
                 } else {
                         /* Initial state */
                         stick_state = STATE_UNLOCKING;
-                        password = malloc(65);
-                        memset(password, 0x0, 65);
+                        //password = malloc(65);
+                        memset(password, 0x0, 64);
                         gpio_set(GPIOC, GPIO13);
                 }
         }
@@ -1001,9 +1078,12 @@ int main(void) {
 
         for (i = 0; i < 0x800000; i++)
                 __asm__("nop");
+        //mbedtls_memory_buffer_alloc_init( memory_buf, sizeof(memory_buf) );
+
 
         lastmsgtock = ticktock + 3000;
         i = 0;
+        current_key_index = 0;
         while (1) {
                 usbd_poll(usbd_dev);
                 /* TODO: This called each second, put here timeouts for operations
@@ -1013,18 +1093,18 @@ int main(void) {
                 if (ticktock - lastmsgtock > 500) {
                         lastmsgtock = ticktock;
                         if (stick_state == STATE_BLOCKED) {
-                          gpio_toggle(GPIOC, GPIO13);
+                                gpio_toggle(GPIOC, GPIO13);
                         }
                         if (stick_state == STATE_PRESIGNBLOCKED && bytes_written) {
-                            if (i < bytes_written * 2) {
-                              gpio_toggle(GPIOC, GPIO13);
-                            } else if (i > bytes_written*2+2) {
-                              i = 0;
-                              gpio_toggle(GPIOC, GPIO13);
-                            }
-                            i++;
+                                if (i < bytes_written * 2) {
+                                        gpio_toggle(GPIOC, GPIO13);
+                                } else if (i > bytes_written*2+2) {
+                                        i = 0;
+                                        gpio_toggle(GPIOC, GPIO13);
+                                }
+                                i++;
                         } else {
-                          i = 0;
+                                i = 0;
                         }
                 }
         }
