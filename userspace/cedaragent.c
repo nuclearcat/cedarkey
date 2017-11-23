@@ -40,6 +40,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/file.h>
 #include <inttypes.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -90,6 +91,7 @@
 /* including null */
 #define VERLEN 6
 #define MAXAGENTCLIENTS 128
+#define PIDFILE ".cedaragent.pid" // as we have only user privileges - only at HOME
 
 int serfd = -1;
 char sockname[4096];
@@ -125,6 +127,69 @@ void stdin_reset (void) {
         tcsetattr (STDIN_FILENO, TCSANOW, &saved_attributes);
 }
 
+int read_pid (char *pidfile) {
+        FILE *f;
+        int pid;
+
+        if (!(f=fopen(pidfile,"r")))
+                return 0;
+        fscanf(f,"%d", &pid);
+        fclose(f);
+        return pid;
+}
+
+int check_pid (char *pidfile) {
+        int pid = read_pid(pidfile);
+
+        if (pid == getpid () || !pid)
+                return 0;
+
+        if (kill(pid, 0) && errno == ESRCH)
+                return(0);
+
+        return pid;
+}
+
+int write_pid (char *pidfile) {
+  FILE *f;
+  int fd;
+  int pid;
+
+  if (check_pid(pidfile)) {
+    printf("Another copy already running, exiting\n");
+    return 0;
+  }
+  if ( ((fd = open(pidfile, O_RDWR|O_CREAT, 0644)) == -1)
+       || ((f = fdopen(fd, "r+")) == NULL) ) {
+      perror("pidfile open() error: ");
+      return 0;
+  }
+
+  if (flock(fd, LOCK_EX|LOCK_NB) == -1) {
+      fscanf(f, "%d", &pid);
+      fclose(f);
+      printf("Can't lock, lock is held by %d.\n", pid);
+      return 0;
+  }
+
+  pid = getpid();
+  if (!fprintf(f,"%d\n", pid)) {
+      perror("pid file write error: ");
+      close(fd);
+      return 0;
+  }
+  fflush(f);
+
+  if (flock(fd, LOCK_UN) == -1) {
+      perror("pidfile unlock error: ");
+      close(fd);
+      return 0;
+  }
+  close(fd);
+
+  return pid;
+}
+
 void stdin_disable_echo (int justsave) {
         struct termios tattr;
 
@@ -137,7 +202,7 @@ void stdin_disable_echo (int justsave) {
         /* Save the terminal attributes so we can restore them later. */
         tcgetattr (STDIN_FILENO, &saved_attributes);
         if (justsave)
-          return;
+                return;
 
         /* Set the funny terminal modes. */
         tcgetattr (STDIN_FILENO, &tattr);
@@ -160,6 +225,7 @@ void fncleanup (void) {
         stdin_reset();
         if (sockname[0])
                 unlink(sockname);
+        unlink(PIDFILE);
         /* Lock dongle! */
         if (serfd > 0)
                 write(serfd, "Z", 1);
@@ -246,7 +312,7 @@ int readexactly(int fd, int howmuch, char *buf) {
                         if (n <= 0) {
                                 // TODO: show errno
                                 if (flag_verbose)
-                                  perror("[read error] ");
+                                        perror("[read error] ");
                                 return(-1);
                         }
                         bytesdone += n;
@@ -254,12 +320,12 @@ int readexactly(int fd, int howmuch, char *buf) {
                                 return(0);
                 } else {
                         if (flag_verbose)
-                          perror("[select error] ");
+                                perror("[select error] ");
                         return(-1); // error happened
                 }
                 // If iotimeout set - we have deadline for I/O
                 if (iotimeout && time(NULL) - started > iotimeout)
-                  return(-1);
+                        return(-1);
         }
         return(0);
 }
@@ -365,6 +431,13 @@ int open_port(char *portname, char *pincode, int checkanswer) {
                 perror("[open_port] Unable to open CedarKey port, ");
                 return(-1);
         }
+        if (flock(fd, LOCK_EX|LOCK_NB) == -1) {
+            printf("[open_port]Can't lock, lock is held by someone\n");
+            close(fd);
+            return(-1);
+        }
+        /* Just in case it's opened, lock back */
+        write(fd, "Z", 1);
         verbose_printf("[open_port] Port successfully opened\n");
         fcntl(fd, F_SETFL, O_RDWR);
 
@@ -670,7 +743,7 @@ void answer_identities(int s) {
 
         verbose_printf("[answer_identities] RECEIVING %d bytes\n", total);
         if (readexactly(serfd, total, (char *)buffer) < 0)
-          return;
+                return;
         verbose_printf("[answer_identities] KEYS RECEIVED\n");
         /* Number of keys field */
         {
@@ -846,16 +919,16 @@ void dongle_keywrite(char *keyfilename) {
         for (int i=0; i<offset; i++) {
                 write_wrapper(serfd, &keybuf[i], 1);
                 if (readexactly(serfd, 1, wrbuf) < 0) {
-                  printf("[writing_key] Key is NOT written. Error, confirmation of byte %d from total %lu not received\n", i, offset);
-                  exit(0);
+                        printf("[writing_key] Key is NOT written. Error, confirmation of byte %d from total %lu not received\n", i, offset);
+                        exit(0);
                 }
 
         }
 
         if (readexactly(serfd, 1, wrbuf) < 0) {
-          printf("[writing_key] Final confirmation not received, key probably not written correctly!\n");
+                printf("[writing_key] Final confirmation not received, key probably not written correctly!\n");
         } else {
-          printf("[writing_key] Key is written\n");
+                printf("[writing_key] Key is written\n");
         }
         exit(0);
 }
@@ -932,70 +1005,70 @@ void show_help(char **argv) {
 }
 
 void add_agentclient(int s2) {
-  int i;
-  for (i=0;i<MAXAGENTCLIENTS;i++) {
-    if (agent_clients[i] == -1) {
-      agent_clients[i] = s2;
-      agent_clients_num++;
-      break;
-    }
-  }
-  // no more space
-  if (i==MAXAGENTCLIENTS) {
-    close(s2);
-  }
+        int i;
+        for (i=0; i<MAXAGENTCLIENTS; i++) {
+                if (agent_clients[i] == -1) {
+                        agent_clients[i] = s2;
+                        agent_clients_num++;
+                        break;
+                }
+        }
+        // no more space
+        if (i==MAXAGENTCLIENTS) {
+                close(s2);
+        }
 }
 
 void remove_agentclient(int s2) {
-  int i;
-  verbose_printf("Removing agent client\n");
-  for (i=0;i<MAXAGENTCLIENTS;i++) {
-    if (agent_clients[i] == s2) {
-      agent_clients[i] = -1;
-      agent_clients_num--;
-      break;
-    }
-  }
-  // no more space
-  if (i==MAXAGENTCLIENTS) {
-    printf("Trying to remove nonexisting client socket?\n");
-    exit(1);
-  }
+        int i;
+        verbose_printf("Removing agent client\n");
+        for (i=0; i<MAXAGENTCLIENTS; i++) {
+                if (agent_clients[i] == s2) {
+                        agent_clients[i] = -1;
+                        agent_clients_num--;
+                        break;
+                }
+        }
+        // no more space
+        if (i==MAXAGENTCLIENTS) {
+                printf("Trying to remove nonexisting client socket?\n");
+                exit(1);
+        }
 }
 
 
 int handle_agentclient_data(int s2, int keynum) {
-          char buf[65536];
-          struct agent_msghdr agentmsg_begin;
-          if (readexactly(s2, 5, buf) < 0) {
-                  remove_agentclient(s2);
-                  return(-1);
-          }
-          memcpy(&agentmsg_begin, buf, 5);
-          agentmsg_begin.message_len = ntohl(agentmsg_begin.message_len);
-          if (agentmsg_begin.message_len > 1) {
-                  if (readexactly(s2, agentmsg_begin.message_len-1, buf) < 0) {
-                          remove_agentclient(s2);
-                          return(-1);
-                  }
-          }
-          /* TODO: implement more :) */
-          switch(agentmsg_begin.message_type) {
-          case SSH_AGENTC_REQUEST_IDENTITIES:
-                  if (keynum == -1)
-                          answer_cached_identities(s2);
-                  else
-                          answer_identities(s2);
-                  break;
-          case SSH_AGENTC_SIGN_REQUEST:
-                  answer_signed(s2, buf, agentmsg_begin.message_len-1);
-                  break;
-          default:
-                  verbose_printf("Unknown action requested %d\n", agentmsg_begin.message_type);
-                  answer_fail(s2);
-                  break;
-          }
-          return(0);
+        char buf[65536];
+        struct agent_msghdr agentmsg_begin;
+        if (readexactly(s2, 5, buf) < 0) {
+                remove_agentclient(s2);
+                return(-1);
+        }
+        memcpy(&agentmsg_begin, buf, 5);
+        agentmsg_begin.message_len = ntohl(agentmsg_begin.message_len);
+        if (agentmsg_begin.message_len > 1) {
+                if (readexactly(s2, agentmsg_begin.message_len-1, buf) < 0) {
+                        remove_agentclient(s2);
+                        return(-1);
+                }
+        }
+        /* TODO: implement more :) */
+        switch(agentmsg_begin.message_type) {
+        case SSH_AGENTC_REQUEST_IDENTITIES:
+                if (keynum == -1)
+                        answer_cached_identities(s2);
+                else
+                        answer_identities(s2);
+                break;
+        case SSH_AGENTC_SIGN_REQUEST:
+                answer_signed(s2, buf, agentmsg_begin.message_len-1);
+                break;
+        default:
+                verbose_printf("Unknown action requested %d\n", agentmsg_begin.message_type);
+                answer_fail(s2);
+                break;
+        }
+        return(0);
 }
 
 
@@ -1024,7 +1097,7 @@ int main(int argc, char **argv)
                 precached_keys_len[i] = 0;
         }
         for (int i = 0; i < MAXAGENTCLIENTS; i++)
-          agent_clients[i] = -1;
+                agent_clients[i] = -1;
 
         while ((c = getopt (argc, argv, "hns:p:Dw:k:b:a:v")) != -1) {
                 switch (c)
@@ -1106,7 +1179,7 @@ int main(int argc, char **argv)
         if (keynum == -1 && !keyfilename) {
                 iotimeout = 15;
                 if (precache_keys()) {
-                  printf("Error during key precaching, exiting\n");
+                        printf("Error during key precaching, exiting\n");
                 }
                 iotimeout = 0;
         } else {
@@ -1116,8 +1189,8 @@ int main(int argc, char **argv)
                 write_wrapper(serfd, switchkey, 2);
                 iotimeout = 3;
                 if (readexactly(serfd, 1, switchkey) < 0) {
-                  printf("Can't switch key, exiting\n");
-                  exit(0);
+                        printf("Can't switch key, exiting\n");
+                        exit(0);
                 }
                 iotimeout = 0;
                 verbose_printf("Switched\n");
@@ -1138,6 +1211,10 @@ int main(int argc, char **argv)
         if (chdir(getenv("HOME"))) {
                 printf("Can't chdir to home directory\n");
                 exit(1);
+        }
+        if (check_pid(PIDFILE)) {
+          printf("Another copy of cedaragent already running, can't start, sorry\n");
+          exit(0);
         }
 
         snprintf(sockname, 4096, ".cedarkey-%s.sock", rndpart);
@@ -1163,6 +1240,10 @@ int main(int argc, char **argv)
         }
         if (flag_daemon)
                 daemon(1, 0);
+        if (!write_pid(PIDFILE)) {
+          printf("pid creation error, exiting\n");
+          exit(1);
+        }
 
         for(;; ) {
                 if (serfd < 0) {
@@ -1178,18 +1259,18 @@ int main(int argc, char **argv)
                         }
                         if (keynum == -1) {
                                 if (precache_keys()) {
-                                  verbose_printf("Error while trying to precache keys, closing device\n");
-                                  close(serfd);
-                                  serfd = -1;
+                                        verbose_printf("Error while trying to precache keys, closing device\n");
+                                        close(serfd);
+                                        serfd = -1;
                                 }
                         } else {
                                 char switchkey[] = "X0";
                                 switchkey[1] = '0' + keynum;
                                 write_wrapper(serfd, switchkey, 2);
                                 if (readexactly(serfd, 1, switchkey) < 0) {
-                                  verbose_printf("Key switching error, closing device\n");
-                                  close(serfd);
-                                  serfd = -1;
+                                        verbose_printf("Key switching error, closing device\n");
+                                        close(serfd);
+                                        serfd = -1;
                                 }
                         }
                 }
@@ -1204,11 +1285,11 @@ int main(int argc, char **argv)
                         continue;
                 }
                 iotimeout = 30;
-                for (int i=0;i<MAXAGENTCLIENTS;i++) {
-                  if (agent_clients[i] != -1 && isready(agent_clients[i], 0)) {
-                    verbose_printf("Handling data from agent client\n");
-                    handle_agentclient_data(agent_clients[i],keynum);
-                  }
+                for (int i=0; i<MAXAGENTCLIENTS; i++) {
+                        if (agent_clients[i] != -1 && isready(agent_clients[i], 0)) {
+                                verbose_printf("Handling data from agent client\n");
+                                handle_agentclient_data(agent_clients[i],keynum);
+                        }
                 };
                 iotimeout = 0;
 
@@ -1217,13 +1298,13 @@ int main(int argc, char **argv)
                         usleep(1);
                         continue;
                 } else {
-                  t = sizeof(remote);
-                  if ((s2 = accept(s, (struct sockaddr *)&remote, (socklen_t *)&t)) == -1) {
-                        perror("accept");
-                        exit(1);
-                  }
-                  verbose_printf("New agent client...\n");
-                  add_agentclient(s2);
+                        t = sizeof(remote);
+                        if ((s2 = accept(s, (struct sockaddr *)&remote, (socklen_t *)&t)) == -1) {
+                                perror("accept");
+                                exit(1);
+                        }
+                        verbose_printf("New agent client...\n");
+                        add_agentclient(s2);
                 }
         }
 

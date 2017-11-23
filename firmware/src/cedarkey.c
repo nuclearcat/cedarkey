@@ -91,7 +91,6 @@ volatile uint32_t ticktock;
 #define STATE_PRESIGN3        7
 #define STATE_KEYSELECT       8
 #define STATE_GETPASS         9
-#define STATE_TERMTEST        251
 #define STATE_BLOCKED         252
 #define STATE_EMPTY           253
 #define STATE_CONFIGWRITE     254
@@ -929,11 +928,6 @@ static void feed_rx_data(char byte) {
                 case 'T':
                         test_key(current_key_index);
                         break;
-
-                case '1':
-                        stick_state = STATE_TERMTEST;
-                        break;
-
 #endif
                 }
         }
