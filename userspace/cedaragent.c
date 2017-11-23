@@ -126,6 +126,7 @@ void stdin_disable_echo (int justsave) {
         tcgetattr (STDIN_FILENO, &saved_attributes);
         if (justsave)
           return;
+
         /* Set the funny terminal modes. */
         tcgetattr (STDIN_FILENO, &tattr);
         tattr.c_lflag &= ~(ICANON | ECHO); /* Clear ICANON and ECHO. */
@@ -947,6 +948,7 @@ int main(int argc, char **argv)
 
         memset(sockname, 0x0, sizeof(sockname));
         /* Lock dongle on exit and cleanup unix socket file */
+        stdin_disable_echo(1); // just save stdin tcattr
         atexit(fncleanup);
 
         /* Initialize precached keys array */
@@ -1008,7 +1010,7 @@ int main(int argc, char **argv)
                 exit(1);
         }
 
-        stdin_disable_echo(1); // just save stdin tcattr
+
 
         if (flag_cfgnew) {
                 char buf[32];

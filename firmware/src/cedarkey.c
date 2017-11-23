@@ -256,7 +256,7 @@ static const char *usb_strings[] = {
 /* Buffer to be used for control requests. */
 uint8_t usbd_control_buffer[128];
 
-static void __attribute__ ((noinline)) usb_send_char(char byte) {
+static void usb_send_char(char byte) {
     while (usbd_ep_write_packet(usbd_dev, 0x82, &byte, 1) == 0) ;
 }
 
