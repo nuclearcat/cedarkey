@@ -3,7 +3,7 @@ CedarKey Security Kit
 
 # Secure SSH Key Storage
 
-This project is mostly intended to protect from "software" (trojans, etc.) extraction of key and to provide more reliable method of storing keys than just keeping it on disk storage.  
+This project is mostly intended to protect from "software" (trojans, etc.) extraction of ssh key and to provide more reliable method of storing keys than just keeping them on disk storage.
 It might be not be as protected as smartcard against all physical attacks, however in some cases, it is more protected as it's transparent and wont have hidden backdoors like smartcards (e.g., [CVE-2017-15361](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2017-15361)) and uses very simple protocol to reduce probability of software exploits using "corner cases" of protocol, such as, for example ASN.1 prone to have overflows and leaks ([MITKRB5-SA-2009-002](https://web.mit.edu/kerberos/advisories/MITKRB5-SA-2009-002.txt), [MS04-007](https://docs.microsoft.com/en-us/security-updates/SecurityBulletins/2004/ms04-007), [CAN-2003-0545](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2003-0545) and much more), due implementation complexity.
 
 The most important feature is the smallest possible size of the firmware.  
@@ -26,7 +26,7 @@ Also we support from RSA-1024 to RSA-4096(gnuk is RSA-2048) and keys are encrypt
 3. 3x female-female wires
 ## Software:
 1. https://github.com/texane/stlink
-2. cross-compiler for arm (TODO: which one?)
+2. cross-compiler for arm arm-none-eabi (for example Ubuntu - gcc-arm-none-eabi package)
 
 ## Preparing hardware
 ### Connect your stm32f103 board to st-link
@@ -34,9 +34,7 @@ Also we support from RSA-1024 to RSA-4096(gnuk is RSA-2048) and keys are encrypt
 * DCLK to DCLK
 * DIO to DIO
 
-
 Small visual guide exist in wiki: https://github.com/nuclearcat/cedarkey/wiki
-
 
 ### Compiling firmware
 * git submodule update --init
@@ -44,7 +42,21 @@ Small visual guide exist in wiki: https://github.com/nuclearcat/cedarkey/wiki
 * make
 * cd ../src
 * make cedarkey.bin
-
 ### Flashing firmware (if everything compiled fine)
 * st-flash erase
 * make cedarkey.stlink-flash
+* Unplug device from USB port and plug back. It should be detected as ttyACM device in dmesg
+### Compiling userspace
+* cd ../../userspace
+* make
+* (optional) sudo make install
+### Initial configuration
+* ./cedaragent -s /dev/ttyACM0 -n
+It is not very critical to have complex/long pin, as it doesn't serve as protection layer against decrypting. It's purpose is just to allow/deny access to device.
+### Adding keys
+* ./cedaragent -s /dev/ttyACM0 -p <<your pin>> -w <<path to key>> -v -D
+  * IMPORTANT! Please choose strong password for your keys. I suggest at least 12 characters, alphanumeric in different case, and special characters (except character ~). This password is used to encrypt your keys, and in case if device firmware extracted, it will buy you time, until hackers decrypt your keys. Or if it is enough long, it will make decryption infeasible.
+  * Note: At the moment it is better to have same password for all keys, if you want them to work automatically. If password is different, you need to launch agent for each one,
+specifying key id with flag -k. This will be fixed in future releases.
+### Running it!
+* ./cedaragent -s /dev/ttyACM0 -p <<your pin>> -b ssh-askpass -a ssh-askpass

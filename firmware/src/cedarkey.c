@@ -255,6 +255,19 @@ static const char *usb_strings[] = {
 /* Buffer to be used for control requests. */
 uint8_t usbd_control_buffer[128];
 
+/* For future use, as its useless now to compare hashes */
+static int secure_memcmp(const void * a, const void *b, const size_t size);
+static int secure_memcmp(const void * a, const void *b, const size_t size) {
+  const unsigned char *_a = (const unsigned char *) a;
+  const unsigned char *_b = (const unsigned char *) b;
+  unsigned char result = 0;
+  size_t i;
+  for (i = 0; i < size; i++) {
+    result |= _a[i] ^ _b[i];
+  }
+  return result;
+}
+
 static void usb_send_char(char byte) {
     while (usbd_ep_write_packet(usbd_dev, 0x82, &byte, 1) == 0) ;
 }
@@ -388,7 +401,7 @@ static int verify_pin(unsigned char *data, uint32_t len) {
         mbedtls_sha512((unsigned char*)input, 128, output, 0);
         memset(input, 0x0, 128);
         // TODO: timing attack protection (as it might weaken - with power analysis can know if pin correct or no)
-        return(memcmp(output, verification_saltedhash_ptr, 64));
+        return(secure_memcmp(output, verification_saltedhash_ptr, 64));
 }
 
 #define KEYBUF_SZ 2048
