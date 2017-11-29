@@ -56,8 +56,6 @@
 #include "mbedtls/error.h"
 #include "mbedtls/sha256.h"
 #include "mbedtls/sha512.h"
-//#include "mbedtls/pk.h"
-
 
 // https://tools.ietf.org/html/draft-miller-ssh-agent-02#page-3
 // Where "key blob" is the standard public key encoding of the key to be removed.
@@ -88,8 +86,6 @@
 #define SSH_AGENT_IDENTITIES_ANSWER                     12
 
 #define MAX_PRECACHED_KEYS 16
-/* including null */
-#define VERLEN 6
 #define MAXAGENTCLIENTS 128
 #define PIDFILE ".cedaragent.pid" // as we have only user privileges - only at HOME
 
@@ -151,43 +147,43 @@ int check_pid (char *pidfile) {
 }
 
 int write_pid (char *pidfile) {
-  FILE *f;
-  int fd;
-  int pid;
+        FILE *f;
+        int fd;
+        int pid;
 
-  if (check_pid(pidfile)) {
-    printf("Another copy already running, exiting\n");
-    return 0;
-  }
-  if ( ((fd = open(pidfile, O_RDWR|O_CREAT, 0644)) == -1)
-       || ((f = fdopen(fd, "r+")) == NULL) ) {
-      perror("pidfile open() error: ");
-      return 0;
-  }
+        if (check_pid(pidfile)) {
+                printf("Another copy already running, exiting\n");
+                return 0;
+        }
+        if ( ((fd = open(pidfile, O_RDWR|O_CREAT, 0644)) == -1)
+             || ((f = fdopen(fd, "r+")) == NULL) ) {
+                perror("pidfile open() error: ");
+                return 0;
+        }
 
-  if (flock(fd, LOCK_EX|LOCK_NB) == -1) {
-      fscanf(f, "%d", &pid);
-      fclose(f);
-      printf("Can't lock, lock is held by %d.\n", pid);
-      return 0;
-  }
+        if (flock(fd, LOCK_EX|LOCK_NB) == -1) {
+                fscanf(f, "%d", &pid);
+                fclose(f);
+                printf("Can't lock, lock is held by %d.\n", pid);
+                return 0;
+        }
 
-  pid = getpid();
-  if (!fprintf(f,"%d\n", pid)) {
-      perror("pid file write error: ");
-      close(fd);
-      return 0;
-  }
-  fflush(f);
+        pid = getpid();
+        if (!fprintf(f,"%d\n", pid)) {
+                perror("pid file write error: ");
+                close(fd);
+                return 0;
+        }
+        fflush(f);
 
-  if (flock(fd, LOCK_UN) == -1) {
-      perror("pidfile unlock error: ");
-      close(fd);
-      return 0;
-  }
-  close(fd);
+        if (flock(fd, LOCK_UN) == -1) {
+                perror("pidfile unlock error: ");
+                close(fd);
+                return 0;
+        }
+        close(fd);
 
-  return pid;
+        return pid;
 }
 
 void stdin_disable_echo (int justsave) {
@@ -424,7 +420,7 @@ int open_port(char *portname, char *pincode, int checkanswer) {
         int fd; /* File descriptor for the port */
         int ret;
         char *buffer;
-        char verstring[VERLEN];
+        char verstring[VER_LEN];
         verbose_printf("[open_port] Opening port\n");
         fd = open(portname, O_RDWR | O_NOCTTY | O_NONBLOCK);
         if (fd == -1)   {
@@ -432,9 +428,9 @@ int open_port(char *portname, char *pincode, int checkanswer) {
                 return(-1);
         }
         if (flock(fd, LOCK_EX|LOCK_NB) == -1) {
-            printf("[open_port]Can't lock, lock is held by someone\n");
-            close(fd);
-            return(-1);
+                printf("[open_port]Can't lock, lock is held by someone\n");
+                close(fd);
+                return(-1);
         }
         /* Just in case it's opened, lock back */
         write(fd, "Z", 1);
@@ -457,8 +453,8 @@ int open_port(char *portname, char *pincode, int checkanswer) {
         if (checkanswer) {
                 verbose_printf("[open_port] Checking dongle version\n");
                 ret = write_wrapper(fd, "V", 1);
-                memset(verstring, 0x0, VERLEN);
-                if (readexactly(fd, VERLEN-1, verstring) < 0) {
+                memset(verstring, 0x0, VER_LEN);
+                if (readexactly(fd, VER_LEN-1, verstring) < 0) {
                         printf("Dongle not ready\n");
                         return(-1);
                 } else {
@@ -1213,8 +1209,8 @@ int main(int argc, char **argv)
                 exit(1);
         }
         if (check_pid(PIDFILE)) {
-          printf("Another copy of cedaragent already running, can't start, sorry\n");
-          exit(0);
+                printf("Another copy of cedaragent already running, can't start, sorry\n");
+                exit(0);
         }
 
         snprintf(sockname, 4096, ".cedarkey-%s.sock", rndpart);
@@ -1241,8 +1237,8 @@ int main(int argc, char **argv)
         if (flag_daemon)
                 daemon(1, 0);
         if (!write_pid(PIDFILE)) {
-          printf("pid creation error, exiting\n");
-          exit(1);
+                printf("pid creation error, exiting\n");
+                exit(1);
         }
 
         for(;; ) {

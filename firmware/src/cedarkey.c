@@ -109,7 +109,6 @@ uint32_t current_key_index = -1;
 usbd_device *usbd_dev;
 uint32_t signature_type = 0;
 
-
 static void pgm_write_key (char *data, uint32_t len);
 static void pgm_config(char *);
 #ifdef ALLOW_READING_KEY
@@ -258,26 +257,26 @@ uint8_t usbd_control_buffer[128];
 /* For future use, as its useless now to compare hashes */
 static int secure_memcmp(const void * a, const void *b, const size_t size);
 static int secure_memcmp(const void * a, const void *b, const size_t size) {
-  const unsigned char *_a = (const unsigned char *) a;
-  const unsigned char *_b = (const unsigned char *) b;
-  unsigned char result = 0;
-  size_t i;
-  for (i = 0; i < size; i++) {
-    result |= _a[i] ^ _b[i];
-  }
-  return result;
+        const unsigned char *_a = (const unsigned char *) a;
+        const unsigned char *_b = (const unsigned char *) b;
+        unsigned char result = 0;
+        size_t i;
+        for (i = 0; i < size; i++) {
+                result |= _a[i] ^ _b[i];
+        }
+        return result;
 }
 
 static void usb_send_char(char byte) {
-    while (usbd_ep_write_packet(usbd_dev, 0x82, &byte, 1) == 0) ;
+        while (usbd_ep_write_packet(usbd_dev, 0x82, &byte, 1) == 0) ;
 }
 
 static void send_ok (void) {
-  usb_send_char('Y');
+        usb_send_char('Y');
 }
 
 static void send_error (void) {
-  usb_send_char('N');
+        usb_send_char('N');
 }
 
 /* Pseudorandom */
@@ -373,10 +372,8 @@ static void walktofreekey(void) {
 /*
    Config structure as follows:
 
-   0x0 - 0x4 option word (uint32_t) - 0xFFFFFFFF - config not written
-    0 bit - if unset - config ok
-    1 bit - enable access timeout (TODO)
-    etc...
+   0x0 - 0x4 option word (uint32_t) - 0xFFFFFFFF - config not ready
+   more details about bits in common.h
    0x4 - 0x44 salt string for pin code
    0x44 - 0x84 pin code salted hash (SHA512)
  */
@@ -526,13 +523,13 @@ static void sign_data_rsa (uint32_t index) {
                 while (ticktock < starttock + 15000) ;
 #endif
                 /*
-                {
+                   {
                         char xout[64];
                         sprintf(xout, "%d\n", rsa.len);
                         for(int i=0; i<strlen(xout); i++)
                                 while(usbd_ep_write_packet(usbd_dev, 0x82, &xout[i], 1) == 0) ;
-                }
-                */
+                   }
+                 */
                 if (!n) {
                         outn = rsa.len;
                         usb_write_packedlen(outn);

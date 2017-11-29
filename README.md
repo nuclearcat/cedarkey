@@ -18,6 +18,7 @@ As alternative you can take a look to [gnuk](https://www.fsij.org/category/gnuk.
   * Cons: Not standards compliant in matters of communication with host, we use own protocol instead of smartcard/pgp
   * Pros: You can use our key on guest PC without asking admin to install smartcard libraries and support, it just have to detect ACM device.
 Also we support from RSA-1024 to RSA-4096(gnuk is RSA-2048) and keys are encrypted by AES256, instead of AES128
+At the moment private keys protection at gnuk is weak, as they are limited with simple KDF and if you don't have very long password, it might be feasible to crack it by bruteforcing. We are using double-KDF (host based + IC based).
 
 # Quickstart (under development)
 ## Required Hardware:
