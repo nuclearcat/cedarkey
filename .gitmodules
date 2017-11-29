@@ -4,3 +4,6 @@
 [submodule "mbedtls"]
 	path = mbedtls
 	url = https://github.com/ARMmbed/mbedtls.git
+[submodule "libscrypt"]
+	path = libscrypt
+	url = https://github.com/technion/libscrypt.git

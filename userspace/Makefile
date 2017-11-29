@@ -1,7 +1,7 @@
 TARGET = cedaragent
-LIBS = -lm -lcrypto -lssh
+LIBS = -lm -lcrypto -lssh ../libscrypt/libscrypt.a
 CC = gcc
-CFLAGS = -g -Wall -I../mbedtls/include
+CFLAGS = -g -Wall -I../mbedtls/include -I../libscrypt
 
 .PHONY: default all clean
 

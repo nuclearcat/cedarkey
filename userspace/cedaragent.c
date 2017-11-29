@@ -56,6 +56,7 @@
 #include "mbedtls/error.h"
 #include "mbedtls/sha256.h"
 #include "mbedtls/sha512.h"
+#include <libscrypt.h>
 
 // https://tools.ietf.org/html/draft-miller-ssh-agent-02#page-3
 // Where "key blob" is the standard public key encoding of the key to be removed.
@@ -88,6 +89,7 @@
 #define MAX_PRECACHED_KEYS 16
 #define MAXAGENTCLIENTS 128
 #define PIDFILE ".cedaragent.pid" // as we have only user privileges - only at HOME
+#define STATIC_SALT "VgdSnx7gJhxFcXwr"
 
 int serfd = -1;
 char sockname[4096];
@@ -256,6 +258,18 @@ void rewritefile(char *name, char *buf, int len) {
         close(wfd);
 }
 
+void bin2char(char *dest, uint8_t *src, size_t len) {
+    char charset[] = "0123456789!#$%&'()*+,-./:;<=>?@[\\]^_`{|}"
+                     "abcdefghijklmnopqrstuvwxyz"
+                     "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    int index;
+  while(len-- > 0) {
+      index = src[len] % (sizeof charset);
+      *dest++ = charset[index];
+  }
+  *dest = '\0';
+}
+
 void rand_str(char *dest, size_t length) {
         char charset[] = "0123456789"
                          "abcdefghijklmnopqrstuvwxyz"
@@ -280,6 +294,20 @@ void time_seed(void) {
         }
         srand(seed);
         return;
+}
+
+char *secondary_password_kdf(char *password) {
+  int r;
+  uint8_t hashbuf[SCRYPT_HASH_LEN];
+  char *dst = malloc(64);
+  memset(dst, 0x0, 64);
+  r = libscrypt_scrypt((uint8_t*)password, strlen(password), (uint8_t*)STATIC_SALT, strlen(STATIC_SALT), 1024, 8, 16, hashbuf, sizeof(hashbuf));
+  if(r != 0) {
+    printf("libscrypt_scrypt failed, exiting\n");
+    exit(1);
+  }
+  bin2char(dst, hashbuf, 60);
+  return(dst);
 }
 
 int isready(int fd, int timeout) {
@@ -588,6 +616,7 @@ void faskpass_startup(void) {
         FILE *fp;
         char pass_cmd[] = "P";
         char pass_end[] = "~";
+        char *kdf_password;
 
         memset(fullcmd, 0x0, 1024);
         strcat(fullcmd, startup_askpass);
@@ -599,10 +628,12 @@ void faskpass_startup(void) {
         if (fgets(fullcmd, sizeof(fullcmd), fp) == NULL)
                 return;
         remove_newlines(fullcmd);
+        kdf_password = secondary_password_kdf(fullcmd);
         write_wrapper(serfd, pass_cmd, 1);
-        write_wrapper(serfd, fullcmd, strlen(fullcmd));
+        write_wrapper(serfd, kdf_password, strlen(kdf_password));
         write_wrapper(serfd, pass_end, 1);
         memset(fullcmd, 0x0, sizeof(fullcmd));
+        free(kdf_password);
         fclose(fp);
 }
 
@@ -858,6 +889,7 @@ void dongle_keywrite(char *keyfilename) {
                 stdin_reset();
                 if (strlen(input_stdin) < 6 || strlen(input_stdin) >= 64) {
                         printf("Too short! More than 6 characters and less than 64\n");
+                        memset(input_stdin_repeat, 0x0, 128);
                         continue;
                 }
         } while (strncmp(input_stdin, input_stdin_repeat, 127));
@@ -866,12 +898,15 @@ void dongle_keywrite(char *keyfilename) {
         /* AES Key generation Move as separate function, shared maybe ? */
         {
                 unsigned char prekey[128];
+                char *kdf_password = secondary_password_kdf(input_stdin);
                 memset(prekey, 0x0, 128);
                 memcpy(prekey, keybuf, KEYSRC_SZ);
-                memcpy(&prekey[32], input_stdin, strlen(input_stdin));
+                memcpy(&prekey[32], kdf_password, strlen(kdf_password));
                 mbedtls_sha256(prekey, 128, key, 0);
                 memset(prekey, 0x0, 128);
+                free(kdf_password);
         }
+
         uint32_t sum = 0;
         for (int x=0; x<32; x++) {
                 sum += key[x];
