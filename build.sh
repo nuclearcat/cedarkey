@@ -11,8 +11,8 @@ fi
 
 if [ "$1" == "prepare" ]; then
 git submodule update --init
-cd scrypt
-git checkout 1.2.1
+#cd scrypt
+#git checkout 1.2.1
 fi
 
 if [ "$1" == "build" ]; then

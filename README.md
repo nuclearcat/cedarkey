@@ -55,7 +55,7 @@ Small visual guide exist in wiki: https://github.com/nuclearcat/cedarkey/wiki
 * ./cedaragent -s /dev/ttyACM0 -n
 It is not very critical to have complex/long pin, as it doesn't serve as protection layer against decrypting. It's purpose is just to allow/deny access to device.
 ### Adding keys
-* ./cedaragent -s /dev/ttyACM0 -p <<your pin>> -w <<path to key>> -v -D
+* ./cedaragent -s /dev/ttyACM0 -p (your pin) -w (path to key) -v -D
   * IMPORTANT! Please choose strong password for your keys. I suggest at least 12 characters, alphanumeric in different case, and special characters (except character ~). This password is used to encrypt your keys, and in case if device firmware extracted, it will buy you time, until hackers decrypt your keys. Or if it is enough long, it will make decryption infeasible.
   * Note: At the moment it is better to have same password for all keys, if you want them to work automatically. If password is different, you need to launch agent for each one,
 specifying key id with flag -k. This will be fixed in future releases.
