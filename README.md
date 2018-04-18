@@ -41,7 +41,9 @@ Small visual guide exist in wiki: https://github.com/nuclearcat/cedarkey/wiki
 * git submodule update --init
 * cd firmware/libopencm3
 * make
-* cd ../src
+* cd ../../libscrypt
+* make
+* cd ../firmware/src
 * make cedarkey.bin
 ### Flashing firmware (if everything compiled fine)
 * st-flash erase
