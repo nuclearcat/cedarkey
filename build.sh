@@ -20,8 +20,9 @@ cd firmware/libopencm3
 make
 cd ../src
 make cedarkey.bin
-cd ../../userspace
-cd userspace
+cd ../../libscrypt
+make
+cd ../userspace
 make
 fi
 
