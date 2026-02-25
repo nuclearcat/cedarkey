@@ -645,7 +645,7 @@ void answer_signed(int s, char *buf, uint32_t len) {
         uint32_t keyblob_len;
         uint32_t signblob_len;
         uint8_t buffer[8192]; // TODO: dynamic
-        struct packdata *pd = packdata_new();
+        struct packdata *pd;
         char *keyblob, *signblob;
         int i;
         char signtype = 0;
