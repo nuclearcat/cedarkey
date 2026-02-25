@@ -173,17 +173,17 @@ int write_pid (char *pidfile) {
         pid = getpid();
         if (!fprintf(f,"%d\n", pid)) {
                 perror("pid file write error: ");
-                close(fd);
+                fclose(f);
                 return 0;
         }
         fflush(f);
 
         if (flock(fd, LOCK_UN) == -1) {
                 perror("pidfile unlock error: ");
-                close(fd);
+                fclose(f);
                 return 0;
         }
-        close(fd);
+        fclose(f);
 
         return pid;
 }
