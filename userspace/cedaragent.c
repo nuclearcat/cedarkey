@@ -1293,7 +1293,7 @@ int main(int argc, char **argv)
                         if (serfd < 0) {
                                 /* Not ready yet ... */
                                 verbose_printf("CedarKey can't be opened yet, retrying after 1s\n");
-                                usleep(1000);
+                                usleep(1000000);
                                 continue;
                         }
                         if (keynum == -1) {
