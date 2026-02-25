@@ -998,8 +998,8 @@ static void pgm_read_key (uint32_t index) {
 static void pgm_config(char *data) {
         uint32_t start_address = FLASH_ADDRESS + CFG_OFFSET;
         uint32_t address_offset = 0;
-        flash_erase_page(start_address);
         flash_unlock();
+        flash_erase_page(start_address);
         /* Program only until sizes */
         while(address_offset < CFG_SIZES_OFFSET) {
                 flash_program_word(start_address + address_offset, *((uint32_t*)(data + address_offset)));
