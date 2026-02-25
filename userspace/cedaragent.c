@@ -242,8 +242,11 @@ int write_wrapper(int fd, void *buf, int len) {
                 ret = write(fd, &wrbuf[written], 1);
                 if (ret > 0) {
                         written += ret;
+                } else if (errno == EINTR) {
+                        continue;
                 } else {
                         perror("write error");
+                        return(-1);
                 }
         }
         return(len);
