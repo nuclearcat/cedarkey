@@ -1077,6 +1077,11 @@ int handle_agentclient_data(int s2, int keynum) {
         }
         memcpy(&agentmsg_begin, buf, 5);
         agentmsg_begin.message_len = ntohl(agentmsg_begin.message_len);
+        if (agentmsg_begin.message_len > sizeof(buf)) {
+                verbose_printf("Agent message too large: %u\n", agentmsg_begin.message_len);
+                remove_agentclient(s2);
+                return(-1);
+        }
         if (agentmsg_begin.message_len > 1) {
                 if (readexactly(s2, agentmsg_begin.message_len-1, buf) < 0) {
                         remove_agentclient(s2);
